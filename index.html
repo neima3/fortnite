@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#f1c40f">
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <title>StormSurge - Battle Royale</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; overflow: hidden; font-family: 'Segoe UI', monospace; }
+    #gameCanvas { display: block; width: 100vw; height: 100vh; }
+    #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div id="loading-screen" style="position:fixed;top:0;left:0;width:100%;height:100%;background:#1a1a2e;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;color:#fff;font-family:monospace;">
+    <h1 style="font-size:48px;color:#f1c40f;text-shadow:0 0 20px #f1c40f;">STORM SURGE</h1>
+    <p style="margin-top:20px;font-size:16px;color:#aaa;">Loading battle royale...</p>
+    <div style="width:200px;height:4px;background:#333;margin-top:20px;border-radius:2px;overflow:hidden;">
+      <div id="loading-bar" style="width:0%;height:100%;background:#f1c40f;transition:width 0.3s;"></div>
+    </div>
+  </div>
+  <canvas id="gameCanvas"></canvas>
+  <div id="ui-layer"></div>
+  <script type="module" src="/src/main.ts"></script>
+  <script>
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
+    // Simulate loading progress
+    let progress = 0;
+    const bar = document.getElementById('loading-bar');
+    const interval = setInterval(() => {
+      progress += Math.random() * 15;
+      if (progress >= 100) { progress = 100; clearInterval(interval); }
+      if (bar) bar.style.width = progress + '%';
+    }, 200);
+    window.addEventListener('load', () => {
+      setTimeout(() => {
+        const screen = document.getElementById('loading-screen');
+        if (screen) { screen.style.opacity = '0'; screen.style.transition = 'opacity 0.5s'; setTimeout(() => screen.remove(), 500); }
+      }, 800);
+    });
+  </script>
+</body>
+</html>

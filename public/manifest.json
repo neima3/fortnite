@@ -1,0 +1,13 @@
+{
+  "name": "StormSurge - Battle Royale",
+  "short_name": "StormSurge",
+  "description": "A 2D top-down battle royale game inspired by Fortnite",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1a1a2e",
+  "theme_color": "#f1c40f",
+  "orientation": "landscape",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
