@@ -131,6 +131,22 @@ export interface Zipline {
   active: boolean;
 }
 
+export interface LootChest {
+  id: string;
+  pos: Vec2;
+  state: 'closed' | 'opening' | 'opened';
+  openTimer: number;
+  items: any[];
+}
+
+export interface NPCVendor {
+  id: string;
+  pos: Vec2;
+  type: 'weaponsmith' | 'healer' | 'blacksmith';
+  name: string;
+  items: any[];
+}
+
 export interface GameState {
   player: Player;
   bots: Player[];
@@ -154,4 +170,6 @@ export interface GameState {
   grenades: Grenade[];
   traps: Trap[];
   supplyDrops: SupplyDrop[];
+  chests: LootChest[];
+  npcs: NPCVendor[];
 }

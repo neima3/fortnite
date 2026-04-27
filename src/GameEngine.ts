@@ -17,6 +17,10 @@ import { GameRenderer, Light, WeatherConfig } from './engine/Renderer.js';
 import { HUDRenderer } from './ui/HUD.js';
 import { PhysicsEngine } from './engine/Physics.js';
 import { VehicleSystem } from './systems/VehicleSystem.js';
+import { BattleBusSystem } from './systems/BattleBusSystem.js';
+import { LootChestSystem } from './systems/LootChestSystem.js';
+import { EmoteSystem } from './systems/EmoteSystem.js';
+import { NPCSystem } from './systems/NPCSystem.js';
 import { createExplosion, createMuzzleFlash, createHitMarker, updateParticle, createBloodSplat, createFootstepDust, createLootBeam } from './entities/Particle.js';
 import { ColyseusSession } from './client/network/ColyseusSession.js';
 import { ProgressionSystem } from './systems/ProgressionSystem.js';
@@ -60,6 +64,10 @@ export class GameEngine {
   private spectatorSystem: SpectatorSystem;
   private bossSystem: BossSystem;
   private aiDirector: AIDirector;
+  private battleBusSystem: BattleBusSystem;
+  private chestSystem: LootChestSystem;
+  private emoteSystem: EmoteSystem;
+  private npcSystem: NPCSystem;
   private gameTime: number = 0;
   private lastDamageTime: number = 0;
   private lastPlayerPos: { x: number; y: number } = { x: 0, y: 0 };
@@ -70,6 +78,12 @@ export class GameEngine {
   private fpsCounter: number = 0;
   private fpsTimer: number = 0;
   private currentFps: number = 60;
+  private busPhase: 'bus' | 'drop' | 'playing' = 'bus';
+  private busState: any = null;
+  private countdownTimer: number = 3;
+  private showCountdown: boolean = false;
+  private graphicsQuality: string = 'high';
+  private settingsLoaded: boolean = false;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -108,6 +122,13 @@ export class GameEngine {
     this.aiDirector = new AIDirector();
     this.renderer.setDayNightSpeed(0.005);
     this.renderer.setWeather({ type: 'clear', intensity: 0, windAngle: Math.PI * 0.25, windSpeed: 50 });
+    this.battleBusSystem = new BattleBusSystem();
+    this.chestSystem = new LootChestSystem();
+    this.chestSystem.spawnChests(this.mapGen.buildings);
+    this.emoteSystem = new EmoteSystem();
+    this.npcSystem = new NPCSystem();
+    this.npcSystem.spawnNPCs(this.mapGen.buildings);
+    this.loadSettings();
 
     const originalApplyDamage = this.combatSystem.applyDamage.bind(this.combatSystem);
     this.combatSystem.applyDamage = (state: GameState, targetId: string, damage: number, attackerId: string) => {
@@ -161,7 +182,7 @@ export class GameEngine {
 
   private showModeSelect() {
     this.menu.showModeSelect(
-      () => { this.menu.hide(); this.input.destroy(); this.input = new InputManager(this.canvas); this.gameStarted = true; this.isMultiplayer = false; this.audioManager.resume(); this.start(); },
+      () => { this.menu.hide(); this.input.destroy(); this.input = new InputManager(this.canvas); this.gameStarted = true; this.isMultiplayer = false; this.audioManager.resume(); this.initBusPhase(); this.start(); },
       () => { this.menu.hide(); this.showMultiplayerLobby(); }
     );
   }
@@ -208,10 +229,25 @@ export class GameEngine {
   }
 
   private showSettings() {
-    this.menu.showMainMenu(
-      () => { this.menu.hide(); this.input.destroy(); this.input = new InputManager(this.canvas); this.gameStarted = true; this.start(); },
-      () => {}
-    );
+    this.menu.showSettings();
+  }
+
+  private loadSettings() {
+    if (this.settingsLoaded) return;
+    this.settingsLoaded = true;
+    try {
+      const saved = JSON.parse(localStorage.getItem('stormsurge_settings') || '{}');
+      if (saved.volume !== undefined) this.audioManager.setVolume(saved.volume / 100);
+      if (saved.quality) this.graphicsQuality = saved.quality;
+    } catch {}
+  }
+
+  private initBusPhase() {
+    this.busPhase = 'bus';
+    this.busState = this.battleBusSystem.init(CONFIG.MAP_SIZE);
+    this.state.matchPhase = 'bus';
+    this.countdownTimer = 3;
+    this.showCountdown = true;
   }
 
   private showPauseMenu() {
@@ -272,6 +308,7 @@ export class GameEngine {
     return {
       player, bots: [], projectiles: [], buildings: [], lootItems: [], particles: [],
       grenades: [], traps: [], supplyDrops: [],
+      chests: [], npcs: [],
       camera: { x: 0, y: 0 }, mapSize,
       stormCenter: { x: mapSize / 2, y: mapSize / 2 }, stormRadius: mapSize * 0.45,
       nextStormCenter: { x: mapSize / 2, y: mapSize / 2 }, nextStormRadius: mapSize * 0.35,
@@ -306,6 +343,17 @@ export class GameEngine {
     if (this.paused || !this.gameStarted) return;
     this.gameTime += dt;
     this.hud.update(dt);
+
+    if (this.busPhase !== 'playing') {
+      this.updateBusPhase(dt);
+      return;
+    }
+
+    if (this.showCountdown) {
+      this.countdownTimer -= dt;
+      if (this.countdownTimer <= 0) this.showCountdown = false;
+      return;
+    }
 
     if (!this.isMultiplayer) this.aiSystem.update(this.state, dt);
     const player = this.state.player;
@@ -536,7 +584,25 @@ export class GameEngine {
     if (input.isKeyDown('f')) {
       const picked = this.lootSystem.tryPickup(this.state, this.state.player);
       const opened = this.itemSystem.tryOpenSupplyDrop(this.state, this.state.player);
+      const chest = this.chestSystem.tryOpen(player.pos, player.radius);
+      const npc = this.npcSystem.tryInteract(player.pos, player.radius);
       if (picked || opened) { this.audioManager.playPickup(); this.renderer.triggerHealFlash(); }
+      if (chest) {
+        this.audioManager.playPickup();
+        const items = this.chestSystem.getChests().find(c => c.id === chest.id);
+        if (items) {
+          for (const item of (items as any).flyingItems || []) {
+            this.state.lootItems.push({
+              id: `loot_${Date.now()}_${Math.random()}`,
+              pos: vec2(item.x, item.y), vel: vec2(0, 0), radius: 15, rotation: 0, alive: true,
+              item: item.weapon || item.type, quantity: item.quantity || 1,
+            });
+          }
+        }
+      }
+      if (npc && !this.npcSystem.isShopOpen()) {
+        this.audioManager.playPickup();
+      }
     }
 
     if (input.isKeyDown('v')) {
@@ -561,6 +627,26 @@ export class GameEngine {
 
     if (input.isKeyDown('f3')) this.showFps = !this.showFps;
 
+    if (input.isKeyDown('tab') && !this.emoteSystem.getState().showWheel) {
+      this.emoteSystem.toggleWheel();
+    }
+    if (this.emoteSystem.getState().showWheel) {
+      const mouseWorld2 = this.camera.screenToWorld(input.mousePos);
+      const screenCX = this.camera.width / 2;
+      const screenCY = this.camera.height / 2;
+      const angle = Math.atan2(input.mousePos.y - screenCY, input.mousePos.x - screenCX);
+      const idx = Math.floor(((angle + Math.PI * 2) % (Math.PI * 2)) / (Math.PI * 2 / 8));
+      this.emoteSystem.setWheelSelection(idx);
+    }
+    if (!input.isKeyDown('tab') && this.emoteSystem.getState().showWheel) {
+      this.emoteSystem.confirmWheelSelection();
+    }
+
+    const emotePlaying = this.emoteSystem.update(dt);
+    if (emotePlaying) {
+      player.vel = { x: 0, y: 0 };
+    }
+
     if (this.isMultiplayer && this.multiplayerSession?.room && this.state.player.alive) {
       this.multiplayerSession.send('move', { x: this.state.player.pos.x, y: this.state.player.pos.y, rotation: this.state.player.rotation });
     }
@@ -572,6 +658,42 @@ export class GameEngine {
     }
 
     this.lastPlayerPos = { x: player.pos.x, y: player.pos.y };
+  }
+
+  private updateBusPhase(dt: number): void {
+    this.renderer.updateDayNight(dt);
+    this.renderer.updateWeather(dt);
+    this.chestSystem.update(dt);
+    this.npcSystem.update(dt);
+
+    const input = this.input;
+    if (this.busPhase === 'bus') {
+      this.busState = this.battleBusSystem.update(this.busState, dt, this.state.player.pos, false, false, false, false, input.isKeyDown(' '));
+      if (input.isKeyDown(' ')) {
+        this.busPhase = 'drop';
+        this.state.matchPhase = 'drop';
+        this.state.player.pos.x = this.busState.busX;
+        this.state.player.pos.y = this.busState.busY;
+        this.camera.follow(this.state.player.pos, dt, 1);
+      }
+    } else if (this.busPhase === 'drop') {
+      this.busState = this.battleBusSystem.update(this.busState, dt, this.state.player.pos,
+        input.isKeyDown('w') || input.isKeyDown('arrowup'),
+        input.isKeyDown('a') || input.isKeyDown('arrowleft'),
+        input.isKeyDown('d') || input.isKeyDown('arrowright'),
+        input.isKeyDown('s') || input.isKeyDown('arrowdown'),
+        false
+      );
+      this.state.player.pos.x = this.busState.dropX || this.state.player.pos.x;
+      this.state.player.pos.y = this.busState.dropY || this.state.player.pos.y;
+      if (this.battleBusSystem.shouldTransitionToPlaying(this.busState)) {
+        this.busPhase = 'playing';
+        this.state.matchPhase = 'playing';
+        this.showCountdown = true;
+        this.countdownTimer = 3;
+        this.stormSystem.update(this.state, 0);
+      }
+    }
   }
 
   private render(): void {
@@ -776,7 +898,15 @@ export class GameEngine {
     this.itemSystem.render(ctx, this.state);
     this.bossSystem.render(ctx, this.state);
     this.vehicleSystem.render(ctx, this.camera);
+    this.chestSystem.render(ctx, this.gameTime);
+    this.npcSystem.render(ctx, this.gameTime);
+    if (!this.npcSystem.isShopOpen()) {
+      (this.npcSystem as any).renderInteractPrompt?.(ctx, this.state.player.pos, this.state.player.radius);
+    }
     this.renderPlayer(ctx, this.state.player);
+    if (this.emoteSystem.getState().active) {
+      this.emoteSystem.renderPlayerEmote(ctx, this.state.player.pos.x, this.state.player.pos.y, this.state.player.radius, this.gameTime);
+    }
 
     this.renderer.renderLights(ctx);
 
@@ -796,6 +926,50 @@ export class GameEngine {
       const v = this.vehicleSystem.getVehicleForPlayer('player')!;
       ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.font = 'bold 14px monospace'; ctx.textAlign = 'center';
       ctx.fillText(`[ ${v.type.toUpperCase()} ] Press B to exit`, this.camera.width / 2, 30);
+    }
+
+    if (this.busPhase !== 'playing') {
+      ctx.restore();
+      this.battleBusSystem.renderBus(ctx, this.busState, this.camera);
+      this.battleBusSystem.renderDropUI(ctx, this.busState, this.camera.width, this.camera.height);
+      ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.fillRect(0, 0, this.camera.width, this.camera.height);
+      ctx.fillStyle = '#f1c40f'; ctx.font = 'bold 36px monospace'; ctx.textAlign = 'center';
+      if (this.busPhase === 'bus') {
+        ctx.fillText('PRESS SPACE TO DEPLOY', this.camera.width / 2, this.camera.height / 2 - 50);
+        ctx.fillStyle = '#aaa'; ctx.font = '18px monospace';
+        ctx.fillText(`Bus Position: ${Math.round(this.busState.busX)}, ${Math.round(this.busState.busY)}`, this.camera.width / 2, this.camera.height / 2);
+      }
+      return;
+    }
+
+    if (this.showCountdown && this.countdownTimer > 0) {
+      const num = Math.ceil(this.countdownTimer);
+      ctx.fillStyle = '#f1c40f'; ctx.font = `bold ${80 + Math.sin(this.gameTime * 10) * 10}px monospace`; ctx.textAlign = 'center';
+      ctx.shadowColor = '#f1c40f'; ctx.shadowBlur = 30;
+      ctx.fillText(num > 0 ? String(num) : 'GO!', this.camera.width / 2, this.camera.height / 2);
+      ctx.shadowBlur = 0;
+    }
+
+    if (this.emoteSystem.getState().showWheel) {
+      this.emoteSystem.renderEmoteWheel(ctx, this.camera.width / 2, this.camera.height / 2, this.input.mousePos.x, this.input.mousePos.y);
+    }
+
+    if (this.npcSystem.isShopOpen()) {
+      this.npcSystem.renderShop(ctx, this.camera.width, this.camera.height, this.state.player.materials);
+    }
+
+    if (this.state.matchPhase === 'ended' && this.state.player.alive) {
+      const t = this.gameTime * 2;
+      ctx.save();
+      ctx.translate(this.camera.width / 2, this.camera.height / 2 - 40);
+      ctx.scale(1 + Math.sin(t) * 0.05, 1 + Math.sin(t) * 0.05);
+      ctx.fillStyle = '#f1c40f'; ctx.font = 'bold 56px monospace'; ctx.textAlign = 'center';
+      ctx.shadowColor = '#f1c40f'; ctx.shadowBlur = 40;
+      ctx.fillText('VICTORY ROYALE!', 0, 0);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#fff'; ctx.font = '18px monospace';
+      ctx.fillText(`Kills: ${this.matchStats.kills} | Damage: ${this.matchStats.damageDealt} | Placement: #1`, 0, 50);
+      ctx.restore();
     }
 
     if (this.showFps) {
@@ -905,6 +1079,10 @@ export class GameEngine {
     const mapData = this.mapGen.generate();
     this.tiles = mapData.tiles;
     this.lootSystem.spawnFloorLoot(this.state);
+    this.chestSystem = new LootChestSystem();
+    this.chestSystem.spawnChests(this.mapGen.buildings);
+    this.npcSystem = new NPCSystem();
+    this.npcSystem.spawnNPCs(this.mapGen.buildings);
     this.mobilitySystem = new MobilitySystem();
     this.mobilitySystem.spawnMobilityFeatures(this.state);
     this.itemSystem = new ItemSystem();
@@ -919,6 +1097,7 @@ export class GameEngine {
     this.aiDirector = new AIDirector();
     this.vehicleSystem = new VehicleSystem();
     this.vehicleSystem.spawnVehicles(CONFIG.MAP_SIZE);
+    this.emoteSystem = new EmoteSystem();
     this.lastTime = performance.now();
     this.matchStats = { kills: 0, damageDealt: 0, buildingsBuilt: 0 };
     this.matchStatsReported = false;
@@ -926,6 +1105,7 @@ export class GameEngine {
     this.replaySystem.clear();
     this.gameTime = 0;
     this.hud = new HUDRenderer();
+    this.initBusPhase();
     this.start();
   }
 

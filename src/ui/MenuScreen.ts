@@ -8,7 +8,75 @@ export class MenuScreen {
     this.container = document.getElementById('ui-layer')!;
   }
 
+  showSettings() {
+    const saved = JSON.parse(localStorage.getItem('stormsurge_settings') || '{}');
+    const vol = saved.volume ?? 50;
+    const quality = saved.quality ?? 'high';
+    this.container.innerHTML = `
+      <div id="settings-menu" style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:linear-gradient(135deg,#1a1a2e,#16213e);color:#fff;font-family:monospace;">
+        <h1 style="font-size:48px;margin-bottom:30px;text-shadow:0 0 20px #f1c40f;">SETTINGS</h1>
+        <div style="width:400px;text-align:left;">
+          <div style="margin-bottom:20px;">
+            <label style="font-size:14px;color:#aaa;display:block;margin-bottom:5px;">MASTER VOLUME: <span id="vol-val">${vol}%</span></label>
+            <input id="setting-volume" type="range" min="0" max="100" value="${vol}" style="width:100%;accent-color:#f1c40f;">
+          </div>
+          <div style="margin-bottom:20px;">
+            <label style="font-size:14px;color:#aaa;display:block;margin-bottom:5px;">GRAPHICS QUALITY</label>
+            <select id="setting-quality" style="width:100%;padding:8px;background:#2c3e50;color:#fff;border:1px solid #f1c40f;border-radius:4px;font-family:monospace;">
+              <option value="low" ${quality === 'low' ? 'selected' : ''}>Low (No Post-FX)</option>
+              <option value="medium" ${quality === 'medium' ? 'selected' : ''}>Medium (Reduced FX)</option>
+              <option value="high" ${quality === 'high' ? 'selected' : ''}>High (Full FX)</option>
+            </select>
+          </div>
+          <div style="margin-bottom:20px;padding:15px;background:rgba(255,255,255,0.05);border-radius:8px;">
+            <h3 style="font-size:14px;color:#f1c40f;margin-bottom:10px;">CONTROLS</h3>
+            <div style="font-size:12px;color:#aaa;line-height:1.8;">
+              WASD: Move | Mouse: Aim & Shoot | 1-5: Weapons<br>
+              Q/E/R/T: Build | G: Material | F: Pickup/Interact<br>
+              X: Reload | B: Vehicle | Space: Glide/Deploy<br>
+              Shift: Sprint | V: Use Item | N: Restart<br>
+              Tab: Emote Wheel | F3: Debug Info
+            </div>
+          </div>
+        </div>
+        <button id="btn-settings-save" style="padding:12px 50px;font-size:20px;background:#f1c40f;color:#1a1a2e;border:none;border-radius:8px;cursor:pointer;margin:10px;font-family:monospace;font-weight:bold;">SAVE & BACK</button>
+        <button id="btn-settings-back" style="padding:10px 40px;font-size:16px;background:transparent;color:#aaa;border:2px solid #aaa;border-radius:8px;cursor:pointer;margin:10px;font-family:monospace;">BACK</button>
+      </div>
+    `;
+    this.container.style.pointerEvents = 'auto';
+    const volInput = document.getElementById('setting-volume') as HTMLInputElement;
+    const volVal = document.getElementById('vol-val');
+    if (volInput) volInput.oninput = () => { if (volVal) volVal.textContent = volInput.value + '%'; };
+    const save = () => {
+      const v = (document.getElementById('setting-volume') as HTMLInputElement)?.value || '50';
+      const q = (document.getElementById('setting-quality') as HTMLSelectElement)?.value || 'high';
+      localStorage.setItem('stormsurge_settings', JSON.stringify({ volume: parseInt(v), quality: q }));
+      this.hide();
+      this.showMainMenu(
+        () => { this.hide(); this.onPlayCallback(); },
+        () => this.showSettings(),
+        () => { this.showProgression(this.progressionData, () => this.showMainMenu(() => {}, () => {})); }
+      );
+    };
+    document.getElementById('btn-settings-back')!.onclick = () => {
+      this.hide();
+      this.showMainMenu(
+        () => { this.hide(); this.onPlayCallback(); },
+        () => this.showSettings(),
+        () => { this.showProgression(this.progressionData, () => this.showMainMenu(() => {}, () => {})); }
+      );
+    };
+    this.visible = true;
+  }
+
+  private onPlayCallback: () => void = () => {};
+  private progressionData: any = {};
+  private showProgressionFn: (() => void) | null = null;
+
   showMainMenu(onPlay: () => void, onSettings: () => void, onCareer?: () => void) {
+    this.onPlayCallback = onPlay;
+    this.progressionData = {};
+    this.showProgressionFn = onCareer || null;
     this.container.innerHTML = `
       <div id="main-menu" style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:linear-gradient(135deg,#1a1a2e,#16213e);color:#fff;font-family:monospace;">
         <h1 style="font-size:64px;margin-bottom:10px;text-shadow:0 0 20px #f1c40f;">STORM SURGE</h1>
