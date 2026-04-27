@@ -3,23 +3,59 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <meta name="theme-color" content="#f1c40f">
+  <meta name="theme-color" content="#1a1a2e">
+  <meta name="description" content="StormSurge - 2D Battle Royale Game">
   <link rel="manifest" href="/manifest.json">
-  <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <title>StormSurge - Battle Royale</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #1a1a2e; overflow: hidden; font-family: 'Segoe UI', monospace; }
-    #gameCanvas { display: block; width: 100vw; height: 100vh; }
-    #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+    body { background: #0a0a1a; overflow: hidden; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; cursor: crosshair; }
+    #gameCanvas { display: block; width: 100vw; height: 100vh; image-rendering: auto; }
+    #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 10; }
+    #ui-layer > * { pointer-events: auto; }
+    #loading-screen {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: linear-gradient(135deg, #0a0a1a 0%, #1a1a3e 50%, #0a0a1a 100%);
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      z-index: 9999; color: #fff; font-family: 'Segoe UI', monospace;
+    }
+    #loading-screen h1 {
+      font-size: 72px; font-weight: 900; letter-spacing: 8px;
+      background: linear-gradient(135deg, #f1c40f, #e67e22, #f1c40f);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text; text-shadow: none;
+      animation: titlePulse 2s ease-in-out infinite;
+    }
+    @keyframes titlePulse {
+      0%, 100% { filter: brightness(1) drop-shadow(0 0 20px rgba(241,196,15,0.5)); }
+      50% { filter: brightness(1.2) drop-shadow(0 0 40px rgba(241,196,15,0.8)); }
+    }
+    #loading-screen .subtitle { margin-top: 10px; font-size: 16px; color: #666; letter-spacing: 4px; text-transform: uppercase; }
+    #loading-bar-container {
+      width: 300px; height: 6px; background: rgba(255,255,255,0.1);
+      margin-top: 40px; border-radius: 3px; overflow: hidden;
+      box-shadow: 0 0 20px rgba(241,196,15,0.1);
+    }
+    #loading-bar {
+      width: 0%; height: 100%;
+      background: linear-gradient(90deg, #f1c40f, #e67e22);
+      border-radius: 3px; transition: width 0.3s ease;
+      box-shadow: 0 0 10px rgba(241,196,15,0.5);
+    }
+    #loading-screen .tips { margin-top: 60px; font-size: 12px; color: #444; text-align: center; line-height: 1.8; }
   </style>
 </head>
 <body>
-  <div id="loading-screen" style="position:fixed;top:0;left:0;width:100%;height:100%;background:#1a1a2e;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;color:#fff;font-family:monospace;">
-    <h1 style="font-size:48px;color:#f1c40f;text-shadow:0 0 20px #f1c40f;">STORM SURGE</h1>
-    <p style="margin-top:20px;font-size:16px;color:#aaa;">Loading battle royale...</p>
-    <div style="width:200px;height:4px;background:#333;margin-top:20px;border-radius:2px;overflow:hidden;">
-      <div id="loading-bar" style="width:0%;height:100%;background:#f1c40f;transition:width 0.3s;"></div>
+  <div id="loading-screen">
+    <h1>STORM SURGE</h1>
+    <p class="subtitle">Battle Royale</p>
+    <div id="loading-bar-container">
+      <div id="loading-bar"></div>
+    </div>
+    <div class="tips">
+      WASD: Move | Mouse: Aim & Shoot | 1-5: Weapons<br>
+      Q/E/R/T: Build | G: Material | F: Pickup | X: Reload | B: Vehicle | Space: Glide<br>
+      Shift: Sprint | V: Use Item | N: Restart | F3: Debug
     </div>
   </div>
   <canvas id="gameCanvas"></canvas>
@@ -27,19 +63,26 @@
   <script type="module" src="/src/main.ts"></script>
   <script>
     if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');
-    // Simulate loading progress
     let progress = 0;
     const bar = document.getElementById('loading-bar');
+    const tips = ['Deploying combat systems...', 'Generating terrain...', 'Loading weapons...', 'Spawning loot...', 'Calibrating storm...', 'Preparing vehicles...', 'Almost ready...'];
+    const tipEl = document.querySelector('.tips');
     const interval = setInterval(() => {
-      progress += Math.random() * 15;
+      progress += Math.random() * 12 + 3;
       if (progress >= 100) { progress = 100; clearInterval(interval); }
       if (bar) bar.style.width = progress + '%';
-    }, 200);
+      if (tipEl && Math.random() > 0.6) {
+        const tip = tips[Math.floor(Math.random() * tips.length)];
+        const lines = tipEl.innerHTML.split('<br>');
+        lines[0] = tip;
+        tipEl.innerHTML = lines.join('<br>');
+      }
+    }, 250);
     window.addEventListener('load', () => {
       setTimeout(() => {
         const screen = document.getElementById('loading-screen');
-        if (screen) { screen.style.opacity = '0'; screen.style.transition = 'opacity 0.5s'; setTimeout(() => screen.remove(), 500); }
-      }, 800);
+        if (screen) { screen.style.opacity = '0'; screen.style.transition = 'opacity 0.8s ease'; setTimeout(() => screen.remove(), 800); }
+      }, 1200);
     });
   </script>
 </body>

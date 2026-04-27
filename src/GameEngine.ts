@@ -13,7 +13,11 @@ import { ItemSystem } from './systems/ItemSystem.js';
 import { AISystem } from './systems/AISystem.js';
 import { MenuScreen } from './ui/MenuScreen.js';
 import { AudioManager } from './engine/AudioManager.js';
-import { createExplosion, createMuzzleFlash, createHitMarker, updateParticle } from './entities/Particle.js';
+import { GameRenderer, Light, WeatherConfig } from './engine/Renderer.js';
+import { HUDRenderer } from './ui/HUD.js';
+import { PhysicsEngine } from './engine/Physics.js';
+import { VehicleSystem } from './systems/VehicleSystem.js';
+import { createExplosion, createMuzzleFlash, createHitMarker, updateParticle, createBloodSplat, createFootstepDust, createLootBeam } from './entities/Particle.js';
 import { ColyseusSession } from './client/network/ColyseusSession.js';
 import { ProgressionSystem } from './systems/ProgressionSystem.js';
 import { ReplaySystem } from './systems/ReplaySystem.js';
@@ -42,17 +46,30 @@ export class GameEngine {
   private gameStarted: boolean = false;
   private paused: boolean = false;
   private audioManager: AudioManager;
-  private screenShake: number = 0;
+  private renderer: GameRenderer;
+  private hud: HUDRenderer;
+  private physics: PhysicsEngine;
+  private vehicleSystem: VehicleSystem;
+  private matchStats = { kills: 0, damageDealt: 0, buildingsBuilt: 0 };
+  private matchStatsReported = false;
   private multiplayerSession: ColyseusSession | null = null;
   private isMultiplayer: boolean = false;
   private remotePlayers: Map<string, any> = new Map();
   private progression: ProgressionSystem;
-  private matchStats = { kills: 0, damageDealt: 0, buildingsBuilt: 0 };
-  private matchStatsReported = false;
   private replaySystem: ReplaySystem;
   private spectatorSystem: SpectatorSystem;
   private bossSystem: BossSystem;
   private aiDirector: AIDirector;
+  private gameTime: number = 0;
+  private lastDamageTime: number = 0;
+  private lastPlayerPos: { x: number; y: number } = { x: 0, y: 0 };
+  private playerInVehicle: boolean = false;
+  private currentWeaponSpread: number = 0;
+  private crosshairOnTarget: boolean = false;
+  private showFps: boolean = false;
+  private fpsCounter: number = 0;
+  private fpsTimer: number = 0;
+  private currentFps: number = 60;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -71,7 +88,7 @@ export class GameEngine {
     this.mobilitySystem.spawnMobilityFeatures(this.state);
     this.itemSystem = new ItemSystem();
     this.aiSystem = new AISystem(this.combatSystem);
-    this.aiSystem.spawnBots(this.state, 20);
+    this.aiSystem.spawnBots(this.state, 50);
     this.stormSystem = new StormSystem();
     this.state.stormRadius = CONFIG.MAP_SIZE * 0.8;
     this.state.stormCenter = vec2(CONFIG.MAP_SIZE / 2, CONFIG.MAP_SIZE / 2);
@@ -79,23 +96,55 @@ export class GameEngine {
     this.state.nextStormRadius = CONFIG.MAP_SIZE * 0.8;
     this.menu = new MenuScreen();
     this.audioManager = new AudioManager();
+    this.renderer = new GameRenderer(canvas, this.camera);
+    this.hud = new HUDRenderer();
+    this.physics = new PhysicsEngine();
+    this.vehicleSystem = new VehicleSystem();
+    this.vehicleSystem.spawnVehicles(CONFIG.MAP_SIZE);
     this.progression = new ProgressionSystem();
     this.replaySystem = new ReplaySystem();
     this.spectatorSystem = new SpectatorSystem();
     this.bossSystem = new BossSystem();
     this.aiDirector = new AIDirector();
+    this.renderer.setDayNightSpeed(0.005);
+    this.renderer.setWeather({ type: 'clear', intensity: 0, windAngle: Math.PI * 0.25, windSpeed: 50 });
 
-    // Wrap applyDamage to track match stats
     const originalApplyDamage = this.combatSystem.applyDamage.bind(this.combatSystem);
     this.combatSystem.applyDamage = (state: GameState, targetId: string, damage: number, attackerId: string) => {
       let target = state.player.id === targetId ? state.player : state.bots.find(b => b.id === targetId);
       const wasAlive = target?.alive ?? false;
+      const wasShielded = (target?.shield ?? 0) > 0;
       if (attackerId === 'player') {
         this.matchStats.damageDealt += damage;
       }
+      const prevHealth = target?.health ?? 0;
+      const prevShield = target?.shield ?? 0;
       originalApplyDamage(state, targetId, damage, attackerId);
+      if (target) {
+        const actualDmg = prevHealth - target.health;
+        const shieldDmg = prevShield - target.shield;
+        if (actualDmg > 0 || shieldDmg > 0) {
+          this.hud.addDamageNumber(target.pos.x, target.pos.y, Math.round(actualDmg || shieldDmg), shieldDmg > 0 && actualDmg === 0, false);
+          if (attackerId === 'player') {
+            this.audioManager.playHit();
+          }
+          if (targetId === 'player') {
+            this.renderer.triggerDamageFlash();
+            this.lastDamageTime = this.gameTime;
+            this.audioManager.playDamage();
+          }
+          if (attackerId !== 'player' && targetId === 'player') {
+            this.state.particles.push(...createBloodSplat(target.pos, attackerId === 'player' ? target.rotation + Math.PI : target.rotation));
+          }
+        }
+      }
       if (attackerId === 'player' && wasAlive && target && !target.alive) {
         this.matchStats.kills++;
+        this.renderer.triggerKillFlash();
+        this.audioManager.playElimination();
+        this.hud.addKillFeedEntry(`You eliminated ${target.id}`, true);
+      } else if (wasAlive && target && !target.alive && attackerId !== 'player') {
+        this.hud.addKillFeedEntry(`${attackerId} eliminated ${target.id}`, false);
       }
     };
 
@@ -112,7 +161,7 @@ export class GameEngine {
 
   private showModeSelect() {
     this.menu.showModeSelect(
-      () => { this.menu.hide(); this.input.destroy(); this.input = new InputManager(this.canvas); this.gameStarted = true; this.isMultiplayer = false; this.start(); },
+      () => { this.menu.hide(); this.input.destroy(); this.input = new InputManager(this.canvas); this.gameStarted = true; this.isMultiplayer = false; this.audioManager.resume(); this.start(); },
       () => { this.menu.hide(); this.showMultiplayerLobby(); }
     );
   }
@@ -120,86 +169,35 @@ export class GameEngine {
   private async showMultiplayerLobby() {
     this.isMultiplayer = true;
     this.multiplayerSession = new ColyseusSession();
-
     const onReady = () => { this.multiplayerSession?.send('ready', {}); };
-    const onStart = () => {
-      this.multiplayerSession?.send('start_match', {});
-      this.menu.hide();
-      this.gameStarted = true;
-      this.start();
-    };
-    const onLeave = () => {
-      this.multiplayerSession?.disconnect();
-      this.showMainMenu();
-    };
-
-    this.multiplayerSession.on('connected', (snapshot) => {
-      this.menu.showLobby(snapshot, true, onReady, onStart, onLeave);
-    });
-
+    const onStart = () => { this.multiplayerSession?.send('start_match', {}); this.menu.hide(); this.gameStarted = true; this.start(); };
+    const onLeave = () => { this.multiplayerSession?.disconnect(); this.showMainMenu(); };
+    this.multiplayerSession.on('connected', (snapshot) => { this.menu.showLobby(snapshot, true, onReady, onStart, onLeave); });
     this.multiplayerSession.on('state', (snapshot) => {
-      if (this.menu.isVisible()) {
-        this.menu.showLobby(snapshot, true, onReady, onStart, onLeave);
-      }
-      for (const p of snapshot.remotePlayers) {
-        this.remotePlayers.set(p.sessionId, p);
-      }
-      // Remove players no longer in snapshot
+      if (this.menu.isVisible()) this.menu.showLobby(snapshot, true, onReady, onStart, onLeave);
+      for (const p of snapshot.remotePlayers) this.remotePlayers.set(p.sessionId, p);
       const activeIds = new Set(snapshot.players.map((p: any) => p.sessionId));
-      for (const id of this.remotePlayers.keys()) {
-        if (!activeIds.has(id)) this.remotePlayers.delete(id);
-      }
+      for (const id of this.remotePlayers.keys()) { if (!activeIds.has(id)) this.remotePlayers.delete(id); }
     });
-
-    this.multiplayerSession.on('match_start', () => {
-      this.menu.hide();
-      this.gameStarted = true;
-      this.start();
-    });
-
+    this.multiplayerSession.on('match_start', () => { this.menu.hide(); this.gameStarted = true; this.start(); });
     try {
       await this.multiplayerSession.connect({ mode: 'solo', playerName: 'Player1' });
-      // Wrap applyDamage to report local-player hits to server
       const originalApplyDamage = this.combatSystem.applyDamage.bind(this.combatSystem);
       this.combatSystem.applyDamage = (state: any, targetId: string, damage: number, attackerId: string) => {
-        if (attackerId === 'player' && this.multiplayerSession?.room) {
-          this.multiplayerSession.send('hit', { targetId, damage });
-        }
+        if (attackerId === 'player' && this.multiplayerSession?.room) this.multiplayerSession.send('hit', { targetId, damage });
         originalApplyDamage(state, targetId, damage, attackerId);
       };
       this.multiplayerSession.on('hit_confirmed', (data: any) => {
         if (data.targetId === this.multiplayerSession?.room?.sessionId) {
           this.state.player.health = data.remainingHealth;
-          if (this.state.player.health <= 0) {
-            this.state.player.health = 0;
-            this.state.player.alive = false;
-            this.state.matchPhase = 'ended';
-          }
+          if (this.state.player.health <= 0) { this.state.player.health = 0; this.state.player.alive = false; this.state.matchPhase = 'ended'; }
         }
       });
-      this.multiplayerSession.on('elimination', (data: any) => {
-        this.state.killFeed.unshift(`${data.attackerId} eliminated ${data.targetId}`);
-        if (this.state.killFeed.length > 5) this.state.killFeed.pop();
-      });
+      this.multiplayerSession.on('elimination', (data: any) => { this.state.killFeed.unshift(`${data.attackerId} eliminated ${data.targetId}`); if (this.state.killFeed.length > 5) this.state.killFeed.pop(); });
       this.multiplayerSession.on('build_confirmed', (data: any) => {
         if (data.ownerId !== this.multiplayerSession?.room?.sessionId) {
           const b = data.building;
-          this.state.buildings.push({
-            id: b.id,
-            pos: { x: b.x, y: b.y },
-            vel: { x: 0, y: 0 },
-            radius: CONFIG.BUILDING_GRID_SIZE / 2,
-            rotation: 0,
-            alive: true,
-            type: b.type,
-            material: b.material,
-            health: b.health,
-            maxHealth: b.maxHealth,
-            building: false,
-            buildProgress: 1,
-            buildTime: 0,
-            builtAt: performance.now() / 1000,
-          } as any);
+          this.state.buildings.push({ id: b.id, pos: { x: b.x, y: b.y }, vel: { x: 0, y: 0 }, radius: CONFIG.BUILDING_GRID_SIZE / 2, rotation: 0, alive: true, type: b.type, material: b.material, health: b.health, maxHealth: b.maxHealth, building: false, buildProgress: 1, buildTime: 0, builtAt: performance.now() / 1000 } as any);
         }
       });
     } catch (err: any) {
@@ -210,7 +208,6 @@ export class GameEngine {
   }
 
   private showSettings() {
-    // Simple settings page
     this.menu.showMainMenu(
       () => { this.menu.hide(); this.input.destroy(); this.input = new InputManager(this.canvas); this.gameStarted = true; this.start(); },
       () => {}
@@ -240,7 +237,6 @@ export class GameEngine {
 
   private createInitialState(): GameState {
     const mapSize = CONFIG.MAP_SIZE;
-
     const player: Player = {
       id: 'player',
       pos: { x: mapSize / 2, y: mapSize / 2 },
@@ -263,8 +259,6 @@ export class GameEngine {
       selectedSlot: 0,
       aiming: false,
     };
-
-    // Spawn player on land
     let spawnFound = false;
     while (!spawnFound) {
       const tx = Math.floor(Math.random() * this.tiles.length);
@@ -275,30 +269,14 @@ export class GameEngine {
         spawnFound = true;
       }
     }
-
     return {
-      player,
-      bots: [],
-      projectiles: [],
-      buildings: [],
-      lootItems: [],
-      particles: [],
-      grenades: [],
-      traps: [],
-      supplyDrops: [],
-      camera: { x: 0, y: 0 },
-      mapSize,
-      stormCenter: { x: mapSize / 2, y: mapSize / 2 },
-      stormRadius: mapSize * 0.45,
-      nextStormCenter: { x: mapSize / 2, y: mapSize / 2 },
-      nextStormRadius: mapSize * 0.35,
-      stormPhase: 0,
-      stormTimer: 0,
-      stormDamage: 1,
-      matchTime: 0,
-      matchPhase: 'playing',
-      playersAlive: 100,
-      killFeed: [],
+      player, bots: [], projectiles: [], buildings: [], lootItems: [], particles: [],
+      grenades: [], traps: [], supplyDrops: [],
+      camera: { x: 0, y: 0 }, mapSize,
+      stormCenter: { x: mapSize / 2, y: mapSize / 2 }, stormRadius: mapSize * 0.45,
+      nextStormCenter: { x: mapSize / 2, y: mapSize / 2 }, nextStormRadius: mapSize * 0.35,
+      stormPhase: 0, stormTimer: 0, stormDamage: 1,
+      matchTime: 0, matchPhase: 'playing', playersAlive: 100, killFeed: [],
     };
   }
 
@@ -307,6 +285,7 @@ export class GameEngine {
     this.running = true;
     this.lastTime = performance.now();
     this.replaySystem.startRecording();
+    this.audioManager.startAmbient();
     requestAnimationFrame(this.loop);
   }
 
@@ -314,45 +293,81 @@ export class GameEngine {
     if (!this.running) return;
     const dt = Math.min((time - this.lastTime) / 1000, 0.1);
     this.lastTime = time;
-
+    this.fpsCounter++;
+    this.fpsTimer += dt;
+    if (this.fpsTimer >= 1) { this.currentFps = this.fpsCounter; this.fpsCounter = 0; this.fpsTimer = 0; }
     this.update(dt);
     this.render();
     this.input.resetFrame();
-
     requestAnimationFrame(this.loop);
   };
 
   private update(dt: number): void {
     if (this.paused || !this.gameStarted) return;
-    if (!this.isMultiplayer) {
-      this.aiSystem.update(this.state, dt);
-    }
+    this.gameTime += dt;
+    this.hud.update(dt);
 
+    if (!this.isMultiplayer) this.aiSystem.update(this.state, dt);
     const player = this.state.player;
     const input = this.input;
+
+    this.renderer.updateDayNight(dt);
+    this.renderer.updateWeather(dt);
+    this.audioManager.setCameraPosition(this.camera.pos.x + this.camera.width / 2, this.camera.pos.y + this.camera.height / 2);
+
+    if (this.gameTime % 30 < dt) {
+      const weatherRoll = Math.random();
+      if (weatherRoll < 0.5) this.renderer.setWeather({ type: 'clear', intensity: 0, windAngle: Math.random() * Math.PI * 2, windSpeed: 30 + Math.random() * 50 });
+      else if (weatherRoll < 0.75) this.renderer.setWeather({ type: 'rain', intensity: 0.3 + Math.random() * 0.5, windAngle: Math.random() * Math.PI * 2, windSpeed: 80 + Math.random() * 120 });
+      else if (weatherRoll < 0.9) this.renderer.setWeather({ type: 'fog', intensity: 0.3 + Math.random() * 0.4, windAngle: 0, windSpeed: 0 });
+      else this.renderer.setWeather({ type: 'storm', intensity: 0.6 + Math.random() * 0.4, windAngle: Math.random() * Math.PI * 2, windSpeed: 150 + Math.random() * 100 });
+    }
+
+    this.renderer.clearLights();
+    this.renderer.addLight({ x: player.pos.x, y: player.pos.y, radius: 300, color: '#ffffff', intensity: 0.3, falloff: 2 });
 
     this.mobilitySystem.update(this.state, dt);
     this.itemSystem.update(this.state, dt);
     this.bossSystem.update(this.state, dt);
     this.aiDirector.update(this.state, dt);
+    this.vehicleSystem.update(this.state, dt);
     this.replaySystem.recordFrame(this.state.matchTime, this.state);
 
-    // Glider deployment on Space
-    if (input.isKeyDown(' ')) {
-      const glideDist = 300;
-      this.mobilitySystem.startGlide(this.state.player, this.state.player.pos.x + Math.cos(this.state.player.rotation) * glideDist, this.state.player.pos.y + Math.sin(this.state.player.rotation) * glideDist);
+    this.playerInVehicle = this.vehicleSystem.getVehicleForPlayer('player') !== null;
+
+    if (input.isKeyDown('b')) {
+      if (this.playerInVehicle) {
+        this.vehicleSystem.tryExit('player');
+        this.playerInVehicle = false;
+      } else {
+        const v = this.vehicleSystem.tryEnter('player', player.pos, true);
+        if (v) this.playerInVehicle = true;
+      }
     }
 
-    // Movement (skip if gliding)
-    if (!this.mobilitySystem.isGliding(this.state.player.id)) {
-      let dx = 0;
-      let dy = 0;
+    if (this.playerInVehicle) {
+      const vehicle = this.vehicleSystem.getVehicleForPlayer('player')!;
+      this.vehicleSystem.handleInput(vehicle, {
+        forward: input.isKeyDown('w') || input.isKeyDown('arrowup'),
+        backward: input.isKeyDown('s') || input.isKeyDown('arrowdown'),
+        left: input.isKeyDown('a') || input.isKeyDown('arrowleft'),
+        right: input.isKeyDown('d') || input.isKeyDown('arrowright'),
+        boost: input.isKeyDown('shift'),
+      }, dt);
+      player.pos.x = vehicle.pos.x;
+      player.pos.y = vehicle.pos.y;
+    } else if (!this.mobilitySystem.isGliding(this.state.player.id)) {
+      let dx = 0, dy = 0;
       if (input.isKeyDown('w') || input.isKeyDown('arrowup')) dy -= 1;
       if (input.isKeyDown('s') || input.isKeyDown('arrowdown')) dy += 1;
       if (input.isKeyDown('a') || input.isKeyDown('arrowleft')) dx -= 1;
       if (input.isKeyDown('d') || input.isKeyDown('arrowright')) dx += 1;
 
-      // Sprint
+      if (input.isKeyDown(' ')) {
+        const glideDist = 300;
+        this.mobilitySystem.startGlide(player, player.pos.x + Math.cos(player.rotation) * glideDist, player.pos.y + Math.sin(player.rotation) * glideDist);
+      }
+
       player.sprinting = input.isKeyDown('shift');
       const baseSpeed = player.speed || CONFIG.PLAYER_SPEED;
       const speed = player.sprinting ? baseSpeed * (CONFIG.PLAYER_SPRINT_SPEED / CONFIG.PLAYER_SPEED) : baseSpeed;
@@ -360,101 +375,86 @@ export class GameEngine {
       if (dx !== 0 || dy !== 0) {
         const dir = vec2Norm({ x: dx, y: dy });
         player.vel = vec2Mul(dir, speed);
+        this.audioManager.playFootstep(player.pos.x, player.pos.y, player.sprinting);
+        if (Math.random() < 0.1) this.state.particles.push(...createFootstepDust(player.pos));
       } else {
         player.vel = { x: 0, y: 0 };
       }
 
       player.pos.x += player.vel.x * dt;
       player.pos.y += player.vel.y * dt;
-
-      // Clamp to map bounds
       player.pos.x = clamp(player.pos.x, player.radius, this.state.mapSize - player.radius);
       player.pos.y = clamp(player.pos.y, player.radius, this.state.mapSize - player.radius);
 
-      // Obstacle collision
-      const p = player;
-      const tx = Math.floor(p.pos.x / CONFIG.TILE_SIZE);
-      const ty = Math.floor(p.pos.y / CONFIG.TILE_SIZE);
+      const tx = Math.floor(player.pos.x / CONFIG.TILE_SIZE);
+      const ty = Math.floor(player.pos.y / CONFIG.TILE_SIZE);
       if (tx >= 0 && tx < this.tiles.length && ty >= 0 && ty < this.tiles[0].length) {
         const tile = this.tiles[tx][ty];
         if (tile.obstacle !== 'none' || tile.biome === 'water') {
-          const dx = p.pos.x - (tile.x + CONFIG.TILE_SIZE / 2);
-          const dy = p.pos.y - (tile.y + CONFIG.TILE_SIZE / 2);
-          const len = Math.sqrt(dx * dx + dy * dy) || 1;
-          const push = p.radius + CONFIG.TILE_SIZE / 2;
-          p.pos.x = tile.x + CONFIG.TILE_SIZE / 2 + (dx / len) * push;
-          p.pos.y = tile.y + CONFIG.TILE_SIZE / 2 + (dy / len) * push;
+          const ddx = player.pos.x - (tile.x + CONFIG.TILE_SIZE / 2);
+          const ddy = player.pos.y - (tile.y + CONFIG.TILE_SIZE / 2);
+          const len = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+          const push = player.radius + CONFIG.TILE_SIZE / 2;
+          player.pos.x = tile.x + CONFIG.TILE_SIZE / 2 + (ddx / len) * push;
+          player.pos.y = tile.y + CONFIG.TILE_SIZE / 2 + (ddy / len) * push;
         }
       }
-
-      // Building collision
       for (const b of this.state.buildings) {
         if (!b.alive) continue;
-        const d = dist(p.pos, b.pos);
-        if (d < p.radius + b.radius) {
-          const dx = p.pos.x - b.pos.x;
-          const dy = p.pos.y - b.pos.y;
+        const d = dist(player.pos, b.pos);
+        if (d < player.radius + b.radius) {
+          const ddx = player.pos.x - b.pos.x;
+          const ddy = player.pos.y - b.pos.y;
           const len = d || 1;
-          const push = p.radius + b.radius;
-          p.pos.x = b.pos.x + (dx / len) * push;
-          p.pos.y = b.pos.y + (dy / len) * push;
+          const push = player.radius + b.radius;
+          player.pos.x = b.pos.x + (ddx / len) * push;
+          player.pos.y = b.pos.y + (ddy / len) * push;
         }
       }
     }
 
-    // Aim at mouse world position
     const mouseWorld = this.camera.screenToWorld(input.mousePos);
-    this.input.setMouseWorld(mouseWorld);
+    input.setMouseWorld(mouseWorld);
     player.rotation = angleTo(player.pos, mouseWorld);
     player.aiming = input.mouseDown;
 
-    // Building controls
-    if (this.input.isKeyDown('q')) this.buildingSystem.setBuildMode('wall');
-    if (this.input.isKeyDown('e')) this.buildingSystem.setBuildMode('floor');
-    if (this.input.isKeyDown('r')) {
-      if (this.buildingSystem.isBuilding) {
-        this.buildingSystem.setBuildMode('stair');
-      }
+    this.crosshairOnTarget = false;
+    for (const bot of this.state.bots) {
+      if (!bot.alive) continue;
+      if (dist(mouseWorld, bot.pos) < bot.radius + 10) { this.crosshairOnTarget = true; break; }
     }
-    if (this.input.isKeyDown('t')) this.buildingSystem.setBuildMode('roof');
-    if (this.input.isKeyDown('g')) this.buildingSystem.toggleMaterial();
-    if (this.input.isKeyDown('escape')) {
-      if (this.buildingSystem.isBuilding) {
-        this.buildingSystem.setBuildMode(null);
-      } else if (this.gameStarted) {
-        if (this.paused) {
-          this.paused = false;
-          this.menu.hide();
-          this.lastTime = performance.now();
-        } else {
-          this.showPauseMenu();
-        }
+
+    const weapon = player.inventory[player.selectedSlot];
+    this.currentWeaponSpread = weapon ? (player.aiming ? weapon.spread * 0.5 : weapon.spread) * (player.sprinting ? 1.5 : 1) : 0;
+
+    if (input.isKeyDown('q')) this.buildingSystem.setBuildMode('wall');
+    if (input.isKeyDown('e')) this.buildingSystem.setBuildMode('floor');
+    if (input.isKeyDown('r') && this.buildingSystem.isBuilding) this.buildingSystem.setBuildMode('stair');
+    if (input.isKeyDown('t')) this.buildingSystem.setBuildMode('roof');
+    if (input.isKeyDown('g')) this.buildingSystem.toggleMaterial();
+    if (input.isKeyDown('escape')) {
+      if (this.buildingSystem.isBuilding) this.buildingSystem.setBuildMode(null);
+      else if (this.gameStarted) {
+        if (this.paused) { this.paused = false; this.menu.hide(); this.lastTime = performance.now(); }
+        else this.showPauseMenu();
       }
     }
 
     this.buildingSystem.updateGhost(player.pos, mouseWorld);
-    if (this.buildingSystem.isBuilding && this.input.mouseClicked) {
+    if (this.buildingSystem.isBuilding && input.mouseClicked) {
       const placed = this.buildingSystem.placeBuilding(this.state);
       if (placed) {
         this.matchStats.buildingsBuilt++;
-        this.audioManager.playBuild();
+        this.audioManager.playBuild(placed.pos.x, placed.pos.y);
         if (this.isMultiplayer && this.multiplayerSession?.room) {
           this.multiplayerSession.send('build', { x: placed.pos.x, y: placed.pos.y, type: placed.type, material: placed.material });
         }
       }
     }
 
-    // Weapon slot selection
-    for (let i = 1; i <= 5; i++) {
-      if (input.isKeyDown(String(i))) {
-        player.selectedSlot = i - 1;
-      }
-    }
+    for (let i = 1; i <= 5; i++) { if (input.isKeyDown(String(i))) player.selectedSlot = i - 1; }
 
-    // Camera follow
-    if (!this.spectatorSystem.active) {
-      this.camera.follow(player.pos, dt, CONFIG.CAMERA_SMOOTH);
-    }
+    if (!this.spectatorSystem.active) this.camera.follow(player.pos, dt, CONFIG.CAMERA_SMOOTH);
 
     if (this.isMultiplayer && this.multiplayerSession?.room?.state) {
       const s = this.multiplayerSession.room.state;
@@ -469,134 +469,109 @@ export class GameEngine {
       this.state.nextStormCenter.y = s.nextStormCenterY ?? this.state.stormCenter.y;
       this.state.playersAlive = s.playersAlive;
       this.state.matchTime = s.matchTime;
-      // Update remote players from server state
       if (s.players?.forEach) {
         const activeIds = new Set<string>();
         s.players.forEach((p: any) => {
           activeIds.add(p.sessionId);
           if (p.sessionId === this.multiplayerSession?.room?.sessionId) {
-            // Update local player health/shield from server
-            this.state.player.health = p.health;
-            this.state.player.shield = p.shield;
-            this.state.player.alive = p.alive;
-          } else {
-            this.remotePlayers.set(p.sessionId, p);
-          }
+            this.state.player.health = p.health; this.state.player.shield = p.shield; this.state.player.alive = p.alive;
+          } else this.remotePlayers.set(p.sessionId, p);
         });
-        // Remove players no longer in state
-        for (const id of this.remotePlayers.keys()) {
-          if (!activeIds.has(id)) this.remotePlayers.delete(id);
-        }
+        for (const id of this.remotePlayers.keys()) { if (!activeIds.has(id)) this.remotePlayers.delete(id); }
       }
-      // End-game detection for client
-      if (!this.state.player.alive) {
-        this.state.matchPhase = 'ended';
-      } else if (this.state.playersAlive <= 1) {
-        this.state.matchPhase = 'ended';
-      }
+      if (!this.state.player.alive) this.state.matchPhase = 'ended';
+      else if (this.state.playersAlive <= 1) this.state.matchPhase = 'ended';
     } else {
-      // Single player: use local storm system
       this.stormSystem.update(this.state, dt);
     }
-    // Storm warning audio
+
     const playerDist = dist(this.state.player.pos, this.state.stormCenter);
-    if (playerDist > this.state.stormRadius && Math.random() < 0.02) {
+    if (playerDist > this.state.stormRadius) {
       this.audioManager.playStormWarning();
+      this.audioManager.setStormIntensity(Math.min(1, (playerDist - this.state.stormRadius) / 200));
+    } else {
+      this.audioManager.setStormIntensity(0);
     }
-    // Check win condition
+
     if (this.state.matchPhase === 'playing' && this.state.playersAlive <= 1 && this.state.player.alive) {
       this.state.matchPhase = 'ended';
       this.state.killFeed.unshift('VICTORY ROYALE!');
+      this.audioManager.playVictory();
     }
 
-    // Spectator mode on death
     if (!this.spectatorSystem.active && !this.state.player.alive && this.state.matchPhase === 'ended') {
       this.spectatorSystem.startSpectating(this.state);
     }
     if (this.spectatorSystem.active) {
       this.spectatorSystem.updateTargets(this.state);
       const target = this.spectatorSystem.getCurrentTarget();
-      if (target) {
-        this.camera.follow(target.pos, dt, 0.05);
-      }
+      if (target) this.camera.follow(target.pos, dt, 0.05);
     }
 
     this.combatSystem.update(this.state, dt);
     this.buildingSystem.updateBuildings(this.state, dt);
-    if (this.input.mouseClicked && !this.buildingSystem.isBuilding) {
-      const weapon = this.state.player.inventory[this.state.player.selectedSlot];
-      if (weapon && weapon.type === 'grenade') {
+
+    if (input.mouseClicked && !this.buildingSystem.isBuilding) {
+      const w = this.state.player.inventory[this.state.player.selectedSlot];
+      if (w && w.type === 'grenade') {
         this.itemSystem.throwGrenade(this.state, this.state.player);
-      } else if (weapon && weapon.type === 'trap') {
+      } else if (w && w.type === 'trap') {
         this.itemSystem.placeTrap(this.state, this.state.player);
       } else {
         const fired = this.combatSystem.fireWeapon(this.state, this.state.player);
-        if (fired) {
-          if (weapon) {
-            this.audioManager.playShoot(weapon.type);
-            this.state.particles.push(...createMuzzleFlash(this.state.player.pos, this.state.player.rotation));
-            this.screenShake = weapon.type === 'shotgun' || weapon.type === 'sniper' ? 5 : 2;
-          }
+        if (fired && w) {
+          this.audioManager.playShoot(w.type, player.pos.x, player.pos.y);
+          this.state.particles.push(...createMuzzleFlash(player.pos, player.rotation));
+          this.renderer.triggerScreenShake(w.type === 'shotgun' || w.type === 'sniper' ? 4 : 1.5, 0.15);
+          this.renderer.addLight({ x: player.pos.x + Math.cos(player.rotation) * 30, y: player.pos.y + Math.sin(player.rotation) * 30, radius: 200, color: '#ffaa44', intensity: 0.8, falloff: 3 });
         }
       }
     }
-    if (this.input.isKeyDown('x')) {
+
+    if (input.isKeyDown('x')) {
       const w = this.state.player.inventory[this.state.player.selectedSlot];
       if (w) this.combatSystem.reload(w);
     }
 
-    if (this.input.isKeyDown('f')) {
+    if (input.isKeyDown('f')) {
       const picked = this.lootSystem.tryPickup(this.state, this.state.player);
       const opened = this.itemSystem.tryOpenSupplyDrop(this.state, this.state.player);
-      if (picked || opened) this.audioManager.playPickup();
+      if (picked || opened) { this.audioManager.playPickup(); this.renderer.triggerHealFlash(); }
     }
 
-    if (this.input.isKeyDown('v')) {
-      this.itemSystem.useConsumable(this.state, this.state.player);
+    if (input.isKeyDown('v')) {
+      if (this.itemSystem.useConsumable(this.state, this.state.player)) {
+        this.audioManager.playHeal();
+        this.renderer.triggerHealFlash();
+      }
     }
 
-    for (const p of this.state.particles) {
-      updateParticle(p, dt);
-    }
+    for (const p of this.state.particles) updateParticle(p, dt);
     this.state.particles = this.state.particles.filter(p => p.alive);
-    if (this.state.particles.length > 500) {
-      this.state.particles = this.state.particles.slice(-500);
-    }
-    if (this.state.projectiles.length > 200) {
-      this.state.projectiles = this.state.projectiles.slice(-200);
-    }
-    this.screenShake *= 0.9;
-    if (this.screenShake < 0.5) this.screenShake = 0;
+    if (this.state.particles.length > 800) this.state.particles = this.state.particles.slice(-800);
+    if (this.state.projectiles.length > 300) this.state.projectiles = this.state.projectiles.slice(-300);
 
-    if (this.input.isKeyDown('n') && this.state.matchPhase === 'ended') {
-      this.restart();
-    }
+    if (input.isKeyDown('n') && this.state.matchPhase === 'ended') this.restart();
+    if (input.isKeyDown('KeyK') && this.state.matchPhase === 'ended') this.showKillCam();
 
-    if (this.input.isKeyDown('KeyK') && this.state.matchPhase === 'ended') {
-      this.showKillCam();
-    }
-
-    // Spectator controls
     if (this.spectatorSystem.active) {
-      if (this.input.isKeyDown('ArrowRight') || this.input.isKeyDown('KeyD')) this.spectatorSystem.nextTarget(this.state);
-      if (this.input.isKeyDown('ArrowLeft') || this.input.isKeyDown('KeyA')) this.spectatorSystem.prevTarget(this.state);
+      if (input.isKeyDown('ArrowRight') || input.isKeyDown('KeyD')) this.spectatorSystem.nextTarget(this.state);
+      if (input.isKeyDown('ArrowLeft') || input.isKeyDown('KeyA')) this.spectatorSystem.prevTarget(this.state);
     }
 
-    // Multiplayer sync
+    if (input.isKeyDown('f3')) this.showFps = !this.showFps;
+
     if (this.isMultiplayer && this.multiplayerSession?.room && this.state.player.alive) {
-      this.multiplayerSession.send('move', {
-        x: this.state.player.pos.x,
-        y: this.state.player.pos.y,
-        rotation: this.state.player.rotation,
-      });
+      this.multiplayerSession.send('move', { x: this.state.player.pos.x, y: this.state.player.pos.y, rotation: this.state.player.rotation });
     }
 
-    // Report match stats when match ends
     if (this.state.matchPhase === 'ended' && !this.matchStatsReported) {
       this.matchStatsReported = true;
       const placement = this.state.player.alive ? 1 : this.state.playersAlive + 1;
       this.progression.reportMatchEnd(placement, this.matchStats.kills, this.matchStats.damageDealt, this.matchStats.buildingsBuilt);
     }
+
+    this.lastPlayerPos = { x: player.pos.x, y: player.pos.y };
   }
 
   private render(): void {
@@ -604,100 +579,83 @@ export class GameEngine {
     const ctx = this.ctx;
     const cam = this.camera;
 
+    this.renderer.beginFrame();
     ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-
-    // Green background
-    ctx.fillStyle = '#2d5a27';
+    ctx.fillStyle = '#1a1a2e';
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
     ctx.save();
-    if (this.screenShake > 0) {
-      const shakeX = (Math.random() - 0.5) * this.screenShake * 2;
-      const shakeY = (Math.random() - 0.5) * this.screenShake * 2;
-      ctx.translate(shakeX, shakeY);
-    }
+    const shake = this.renderer.getScreenShake();
+    ctx.translate(shake.x, shake.y);
     ctx.translate(-cam.pos.x, -cam.pos.y);
 
-    // Terrain rendering
     const tileSize = CONFIG.TILE_SIZE;
     const startX = Math.max(0, Math.floor(cam.pos.x / tileSize) - 1);
     const endX = Math.min(this.tiles.length, Math.ceil((cam.pos.x + cam.width) / tileSize) + 1);
     const startY = Math.max(0, Math.floor(cam.pos.y / tileSize) - 1);
     const endY = Math.min(this.tiles[0].length, Math.ceil((cam.pos.y + cam.height) / tileSize) + 1);
+    this.mapGen.renderChunk(ctx, startX, startY, endX, endY, tileSize, this.gameTime);
 
-    for (let tx = startX; tx < endX; tx++) {
-      for (let ty = startY; ty < endY; ty++) {
-        const tile = this.tiles[tx][ty];
-        ctx.fillStyle = this.getBiomeColor(tile.biome);
-        ctx.fillRect(tile.x, tile.y, tileSize, tileSize);
-        if (tile.obstacle === 'tree') {
-          ctx.fillStyle = '#2d5016';
-          ctx.beginPath();
-          ctx.arc(tile.x + tileSize / 2, tile.y + tileSize / 2, tileSize * 0.4, 0, Math.PI * 2);
-          ctx.fill();
-        } else if (tile.obstacle === 'rock') {
-          ctx.fillStyle = '#7f8c8d';
-          ctx.beginPath();
-          ctx.arc(tile.x + tileSize / 2, tile.y + tileSize / 2, tileSize * 0.3, 0, Math.PI * 2);
-          ctx.fill();
-        } else if (tile.obstacle === 'bush') {
-          ctx.fillStyle = '#27ae60';
-          ctx.beginPath();
-          ctx.arc(tile.x + tileSize / 2, tile.y + tileSize / 2, tileSize * 0.35, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-    }
+    const viewLeft = cam.pos.x - 200;
+    const viewRight = cam.pos.x + cam.width + 200;
+    const viewTop = cam.pos.y - 200;
+    const viewBottom = cam.pos.y + cam.height + 200;
 
-    const viewLeft = cam.pos.x - 100;
-    const viewRight = cam.pos.x + cam.width + 100;
-    const viewTop = cam.pos.y - 100;
-    const viewBottom = cam.pos.y + cam.height + 100;
-
-    // Loot items
     for (const loot of this.state.lootItems) {
       if (!loot.alive) continue;
-      // Cull off-screen loot
       if (loot.pos.x < viewLeft || loot.pos.x > viewRight || loot.pos.y < viewTop || loot.pos.y > viewBottom) continue;
       ctx.save();
       ctx.translate(loot.pos.x, loot.pos.y);
-      ctx.fillStyle = typeof loot.item === 'string' ? '#f39c12' : '#e74c3c';
-      ctx.beginPath(); ctx.arc(0, 0, loot.radius, 0, Math.PI * 2); ctx.fill();
+      const pulse = 1 + Math.sin(this.gameTime * 4) * 0.15;
+      const lootRadius = loot.radius * pulse;
+      const rarityColors: Record<string, string> = { common: '#8d8d8d', uncommon: '#30b42d', rare: '#3caceb', epic: '#b44ceb', legendary: '#eb9b3c' };
+      const rarityColor = typeof loot.item === 'object' && (loot.item as any).rarity ? (rarityColors[(loot.item as any).rarity as string] || '#f39c12') : '#f39c12';
+      ctx.shadowColor = rarityColor;
+      ctx.shadowBlur = 15;
+      ctx.fillStyle = rarityColor;
+      ctx.beginPath(); ctx.arc(0, 0, lootRadius, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
       ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
-      ctx.fillStyle = '#fff'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
-      const label = typeof loot.item === 'string' ? loot.item : loot.item.name;
-      ctx.fillText(label.substring(0, 4), 0, 4);
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center';
+      const label = typeof loot.item === 'string' ? loot.item : (loot.item as any).name || '?';
+      ctx.fillText(label.substring(0, 4).toUpperCase(), 0, 3);
+      this.state.particles.push(...createLootBeam(loot.pos, rarityColor));
       ctx.restore();
     }
 
-    // Draw buildings
-    ctx.fillStyle = '#8e44ad';
+    ctx.fillStyle = '#6b4f3a';
+    ctx.strokeStyle = '#4a3525';
+    ctx.lineWidth = 3;
     for (const b of this.mapGen.buildings) {
       if (b.x + b.width < viewLeft || b.x > viewRight || b.y + b.height < viewTop || b.y > viewBottom) continue;
       ctx.fillRect(b.x, b.y, b.width, b.height);
-      ctx.strokeStyle = '#6c3483';
-      ctx.lineWidth = 2;
       ctx.strokeRect(b.x, b.y, b.width, b.height);
+      ctx.fillStyle = 'rgba(0,0,0,0.15)';
+      for (let wx = b.x; wx < b.x + b.width; wx += 50) { ctx.fillRect(wx, b.y, 2, b.height); }
+      for (let wy = b.y; wy < b.y + b.height; wy += 50) { ctx.fillRect(b.x, wy, b.width, 2); }
+      ctx.fillStyle = '#6b4f3a';
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center';
+      ctx.fillText(b.name, b.x + b.width / 2, b.y + b.height / 2);
+      ctx.fillStyle = '#6b4f3a';
     }
 
-    // Ghost preview
     if (this.buildingSystem.isBuilding && this.buildingSystem.getGhostPos()) {
       const ghost = this.buildingSystem.getGhostPos()!;
       const canPlace = this.buildingSystem.canPlace(this.state);
       ctx.save();
       ctx.translate(ghost.x, ghost.y);
       ctx.globalAlpha = 0.4;
-      ctx.fillStyle = canPlace ? '#3498db' : '#e74c3c';
+      ctx.fillStyle = canPlace ? 'rgba(52,152,219,0.6)' : 'rgba(231,76,60,0.6)';
       const mode = this.buildingSystem.getBuildMode();
       const r = CONFIG.BUILDING_GRID_SIZE / 2;
       if (mode === 'wall') ctx.fillRect(-r, -r, r * 2, r * 2);
       else if (mode === 'floor') ctx.fillRect(-r, -r, r * 2, r * 2);
       else if (mode === 'stair') { ctx.beginPath(); ctx.moveTo(-r, r); ctx.lineTo(r, r); ctx.lineTo(-r, -r); ctx.closePath(); ctx.fill(); }
       else if (mode === 'roof') { ctx.beginPath(); ctx.moveTo(0, -r); ctx.lineTo(r, 0); ctx.lineTo(0, r); ctx.lineTo(-r, 0); ctx.closePath(); ctx.fill(); }
+      if (canPlace) { ctx.strokeStyle = '#2ecc71'; ctx.lineWidth = 2; ctx.setLineDash([5, 5]); ctx.strokeRect(-r, -r, r * 2, r * 2); ctx.setLineDash([]); }
       ctx.restore();
     }
 
-    // Player-built buildings
     for (const b of this.state.buildings) {
       if (!b.alive) continue;
       if (b.pos.x < viewLeft || b.pos.x > viewRight || b.pos.y < viewTop || b.pos.y > viewBottom) continue;
@@ -706,42 +664,50 @@ export class GameEngine {
       const alpha = b.building ? 0.5 + b.buildProgress * 0.5 : 1;
       ctx.globalAlpha = alpha;
       ctx.fillStyle = this.buildingSystem.getMaterialColor(b.material);
+      ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+      ctx.lineWidth = 2;
       if (b.type === 'wall') {
         ctx.fillRect(-b.radius, -b.radius, b.radius * 2, b.radius * 2);
+        ctx.strokeRect(-b.radius, -b.radius, b.radius * 2, b.radius * 2);
+        ctx.fillStyle = 'rgba(255,255,255,0.1)';
+        ctx.fillRect(-b.radius, -b.radius, b.radius * 2, b.radius);
       } else if (b.type === 'floor') {
         ctx.fillRect(-b.radius, -b.radius, b.radius * 2, b.radius * 2);
-        ctx.strokeStyle = '#fff'; ctx.strokeRect(-b.radius + 2, -b.radius + 2, b.radius * 2 - 4, b.radius * 2 - 4);
+        ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.strokeRect(-b.radius + 3, -b.radius + 3, b.radius * 2 - 6, b.radius * 2 - 6);
       } else if (b.type === 'stair') {
-        ctx.beginPath(); ctx.moveTo(-b.radius, b.radius); ctx.lineTo(b.radius, b.radius); ctx.lineTo(-b.radius, -b.radius); ctx.closePath(); ctx.fill();
+        ctx.beginPath(); ctx.moveTo(-b.radius, b.radius); ctx.lineTo(b.radius, b.radius); ctx.lineTo(-b.radius, -b.radius); ctx.closePath(); ctx.fill(); ctx.stroke();
       } else if (b.type === 'roof') {
-        ctx.beginPath(); ctx.moveTo(0, -b.radius); ctx.lineTo(b.radius, 0); ctx.lineTo(0, b.radius); ctx.lineTo(-b.radius, 0); ctx.closePath(); ctx.fill();
+        ctx.beginPath(); ctx.moveTo(0, -b.radius); ctx.lineTo(b.radius, 0); ctx.lineTo(0, b.radius); ctx.lineTo(-b.radius, 0); ctx.closePath(); ctx.fill(); ctx.stroke();
       }
       if (b.health < b.maxHealth) {
-        ctx.fillStyle = '#333'; ctx.fillRect(-15, -b.radius - 8, 30, 4);
-        ctx.fillStyle = '#2ecc71'; ctx.fillRect(-15, -b.radius - 8, 30 * (b.health / b.maxHealth), 4);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(-15, -b.radius - 10, 30, 5);
+        ctx.fillStyle = b.health > b.maxHealth * 0.5 ? '#2ecc71' : b.health > b.maxHealth * 0.25 ? '#f39c12' : '#e74c3c';
+        ctx.fillRect(-14, -b.radius - 9, 28 * (b.health / b.maxHealth), 3);
       }
       ctx.restore();
     }
 
-    // Map border
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth = 4;
     ctx.strokeRect(0, 0, this.state.mapSize, this.state.mapSize);
 
-    // Draw storm (outside safe zone)
-    ctx.fillStyle = 'rgba(138, 43, 226, 0.3)';
-    ctx.fillRect(-1000, -1000, CONFIG.MAP_SIZE + 2000, CONFIG.MAP_SIZE + 2000);
-    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = 'rgba(138, 43, 226, 0.25)';
     ctx.beginPath();
-    ctx.arc(this.state.stormCenter.x, this.state.stormCenter.y, this.state.stormRadius, 0, Math.PI * 2);
+    ctx.rect(-2000, -2000, CONFIG.MAP_SIZE + 4000, CONFIG.MAP_SIZE + 4000);
+    ctx.arc(this.state.stormCenter.x, this.state.stormCenter.y, this.state.stormRadius, 0, Math.PI * 2, true);
     ctx.fill();
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.strokeStyle = 'rgba(138, 43, 226, 0.8)';
+
+    ctx.strokeStyle = 'rgba(138, 43, 226, 0.9)';
     ctx.lineWidth = 4;
+    ctx.shadowColor = '#8a2be2';
+    ctx.shadowBlur = 15;
     ctx.beginPath();
     ctx.arc(this.state.stormCenter.x, this.state.stormCenter.y, this.state.stormRadius, 0, Math.PI * 2);
     ctx.stroke();
-    if (this.stormSystem['moving'] || this.state.stormTimer > 0) {
+    ctx.shadowBlur = 0;
+
+    if (this.state.stormTimer > 0) {
       ctx.setLineDash([10, 10]);
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
       ctx.lineWidth = 2;
@@ -751,58 +717,45 @@ export class GameEngine {
       ctx.setLineDash([]);
     }
 
-    // Particles
     for (const p of this.state.particles) {
       if (!p.alive) continue;
       if (p.pos.x < viewLeft || p.pos.x > viewRight || p.pos.y < viewTop || p.pos.y > viewBottom) continue;
-      ctx.globalAlpha = 1 - (p.life / p.maxLife);
+      ctx.globalAlpha = Math.max(0, 1 - (p.life / p.maxLife));
       ctx.fillStyle = p.color;
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur = 4;
       ctx.beginPath();
-      ctx.arc(p.pos.x, p.pos.y, p.size * (1 - p.life / p.maxLife), 0, Math.PI * 2);
+      const size = p.size * (1 - (p.life / p.maxLife) * 0.5);
+      ctx.arc(p.pos.x, p.pos.y, size, 0, Math.PI * 2);
       ctx.fill();
+      ctx.shadowBlur = 0;
     }
     ctx.globalAlpha = 1;
 
-    // Projectiles
+    ctx.shadowColor = '#f1c40f';
+    ctx.shadowBlur = 6;
     ctx.fillStyle = '#f1c40f';
     for (const proj of this.state.projectiles) {
       if (!proj.alive) continue;
       if (proj.pos.x < viewLeft || proj.pos.x > viewRight || proj.pos.y < viewTop || proj.pos.y > viewBottom) continue;
+      ctx.save();
+      ctx.translate(proj.pos.x, proj.pos.y);
+      ctx.rotate(proj.rotation);
       ctx.beginPath();
-      ctx.arc(proj.pos.x, proj.pos.y, proj.radius, 0, Math.PI * 2);
+      ctx.ellipse(0, 0, proj.radius * 2, proj.radius, 0, 0, Math.PI * 2);
       ctx.fill();
+      ctx.restore();
     }
+    ctx.shadowBlur = 0;
 
-    // Draw bots (single-player only)
     if (!this.isMultiplayer) {
       for (const bot of this.state.bots) {
         if (!bot.alive) continue;
-        // Cull off-screen bots
         if (bot.pos.x < viewLeft || bot.pos.x > viewRight || bot.pos.y < viewTop || bot.pos.y > viewBottom) continue;
-        ctx.save();
-        ctx.translate(bot.pos.x, bot.pos.y);
-        ctx.rotate(bot.rotation);
-        ctx.fillStyle = '#e74c3c';
-        ctx.beginPath();
-        ctx.arc(0, 0, bot.radius, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = '#fff';
-        ctx.beginPath();
-        ctx.moveTo(bot.radius + 5, 0);
-        ctx.lineTo(bot.radius - 5, -5);
-        ctx.lineTo(bot.radius - 5, 5);
-        ctx.fill();
-        ctx.restore();
-        // Health bar above bot
-        const barW = 30;
-        ctx.fillStyle = '#333';
-        ctx.fillRect(bot.pos.x - barW / 2, bot.pos.y - bot.radius - 10, barW, 4);
-        ctx.fillStyle = bot.health > 50 ? '#2ecc71' : '#e74c3c';
-        ctx.fillRect(bot.pos.x - barW / 2, bot.pos.y - bot.radius - 10, barW * (bot.health / CONFIG.PLAYER_MAX_HEALTH), 4);
+        this.renderBot(ctx, bot);
       }
     }
 
-    // Draw remote players
     for (const [sessionId, rp] of this.remotePlayers) {
       if (sessionId === this.multiplayerSession?.room?.sessionId) continue;
       if (!rp.alive) continue;
@@ -810,244 +763,138 @@ export class GameEngine {
       ctx.translate(rp.x, rp.y);
       ctx.rotate(rp.rotation || 0);
       ctx.fillStyle = '#9b59b6';
-      ctx.beginPath();
-      ctx.arc(0, 0, CONFIG.PLAYER_RADIUS, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.beginPath(); ctx.arc(0, 0, CONFIG.PLAYER_RADIUS, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = '#6c3483'; ctx.lineWidth = 2; ctx.stroke();
       ctx.fillStyle = '#fff';
-      ctx.beginPath();
-      ctx.moveTo(CONFIG.PLAYER_RADIUS + 5, 0);
-      ctx.lineTo(CONFIG.PLAYER_RADIUS - 5, -5);
-      ctx.lineTo(CONFIG.PLAYER_RADIUS - 5, 5);
-      ctx.fill();
+      ctx.beginPath(); ctx.moveTo(CONFIG.PLAYER_RADIUS + 5, 0); ctx.lineTo(CONFIG.PLAYER_RADIUS - 5, -5); ctx.lineTo(CONFIG.PLAYER_RADIUS - 5, 5); ctx.fill();
       ctx.restore();
-      // Name tag
-      ctx.fillStyle = '#fff';
-      ctx.font = '10px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText(rp.name || 'Player', rp.x, rp.y - CONFIG.PLAYER_RADIUS - 8);
+      ctx.fillStyle = '#fff'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+      ctx.fillText(rp.name || 'Player', rp.x, rp.y - CONFIG.PLAYER_RADIUS - 12);
     }
 
-    // Mobility features
     this.mobilitySystem.render(ctx, this.state);
-
-    // Items (grenades, traps, supply drops)
     this.itemSystem.render(ctx, this.state);
-
-    // Bosses
     this.bossSystem.render(ctx, this.state);
-
-    // Player
+    this.vehicleSystem.render(ctx, this.camera);
     this.renderPlayer(ctx, this.state.player);
+
+    this.renderer.renderLights(ctx);
 
     ctx.restore();
 
-    // HUD
-    this.renderHUD();
+    this.renderer.renderWeather(ctx, cam.pos.x, cam.pos.y, cam.width, cam.height);
+    this.renderer.renderScreenEffects(ctx, this.state.player.health, CONFIG.PLAYER_MAX_HEALTH);
+    this.renderer.renderFlashlight(ctx, this.state.player.pos.x, this.state.player.pos.y, this.state.player.rotation);
+    this.renderer.applyPostProcessing(ctx);
+
+    this.hud.renderCrosshair(ctx, this.camera.width / 2, this.camera.height / 2, this.currentWeaponSpread, this.crosshairOnTarget, this.state.player.inventory[this.state.player.selectedSlot]?.type === 'sniper');
+
+    const nearbyLoot = this.state.lootItems.filter(l => l.alive && dist(this.state.player.pos, l.pos) < l.radius + this.state.player.radius + 25);
+    this.hud.render(ctx, this.camera.width, this.camera.height, this.state.player, this.state, this.camera, this.buildingSystem.isBuilding ? this.buildingSystem.getBuildMode() : null, this.buildingSystem.getMaterial(), nearbyLoot);
+
+    if (this.playerInVehicle) {
+      const v = this.vehicleSystem.getVehicleForPlayer('player')!;
+      ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.font = 'bold 14px monospace'; ctx.textAlign = 'center';
+      ctx.fillText(`[ ${v.type.toUpperCase()} ] Press B to exit`, this.camera.width / 2, 30);
+    }
+
+    if (this.showFps) {
+      ctx.fillStyle = '#fff'; ctx.font = '12px monospace'; ctx.textAlign = 'left';
+      ctx.fillText(`FPS: ${this.currentFps}`, 10, this.camera.height - 10);
+      ctx.fillText(`Particles: ${this.state.particles.length}`, 10, this.camera.height - 28);
+      ctx.fillText(`Time: ${this.renderer.getTimeOfDay().toFixed(1)}h`, 10, this.camera.height - 46);
+    }
+
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.font = '10px monospace';
+    ctx.fillText('F3: Debug | B: Vehicle', 10, this.camera.height - 5);
   }
 
   private renderPlayer(ctx: CanvasRenderingContext2D, player: Player): void {
     const { x, y } = player.pos;
     const r = player.radius;
 
-    // Body
-    ctx.fillStyle = '#4a90d9';
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(player.rotation);
 
-    // Direction indicator
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(x, y);
-    ctx.lineTo(x + Math.cos(player.rotation) * (r + 10), y + Math.sin(player.rotation) * (r + 10));
-    ctx.stroke();
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    ctx.beginPath(); ctx.ellipse(2, 2, r + 2, r, 0, 0, Math.PI * 2); ctx.fill();
 
-    // Outline
-    ctx.strokeStyle = '#2c3e50';
+    const grad = ctx.createRadialGradient(-3, -3, 0, 0, 0, r);
+    grad.addColorStop(0, '#6bb5ff');
+    grad.addColorStop(1, '#2a7cc7');
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
+
+    ctx.strokeStyle = '#1a5a9c';
     ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.stroke();
+
+    const weapon = player.inventory[player.selectedSlot];
+    if (weapon && weapon.type !== 'pickaxe') {
+      ctx.fillStyle = '#555';
+      ctx.fillRect(r - 2, -2.5, 14, 5);
+      ctx.fillStyle = '#888';
+      ctx.fillRect(r + 8, -3.5, 4, 7);
+    } else {
+      ctx.fillStyle = '#aaa';
+      ctx.fillRect(r - 2, -2, 10, 4);
+    }
+
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.beginPath(); ctx.arc(-4, -4, r * 0.5, 0, Math.PI * 2); ctx.fill();
+
+    ctx.restore();
   }
 
-  private getBiomeColor(biome: Biome): string {
-    switch (biome) {
-      case 'water': return '#2980b9';
-      case 'beach': return '#f4d03f';
-      case 'grass': return '#58d68d';
-      case 'forest': return '#2ecc71';
-      case 'mountain': return '#95a5a6';
-      default: return '#58d68d';
-    }
-  }
+  private renderBot(ctx: CanvasRenderingContext2D, bot: Player): void {
+    ctx.save();
+    ctx.translate(bot.pos.x, bot.pos.y);
 
-  private renderHUD() {
-    const ctx = this.ctx; const p = this.state.player;
-    const cw = this.camera.width; const ch = this.camera.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    ctx.beginPath(); ctx.ellipse(2, 2, bot.radius + 2, bot.radius, 0, 0, Math.PI * 2); ctx.fill();
 
-    // Health bar (bottom center, above weapon slots)
-    const barW = 200, barH = 20;
-    const bx = cw / 2 - barW / 2;
-    const by = ch - 80;
-    ctx.fillStyle = '#333'; ctx.fillRect(bx, by, barW, barH);
-    ctx.fillStyle = '#e74c3c'; ctx.fillRect(bx, by, barW * (p.health / CONFIG.PLAYER_MAX_HEALTH), barH);
-    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(bx, by, barW, barH);
-    ctx.fillStyle = '#fff'; ctx.font = 'bold 12px monospace'; ctx.textAlign = 'center';
-    ctx.fillText(`${Math.ceil(p.health)} HP`, bx + barW / 2, by + 15);
+    ctx.save();
+    ctx.rotate(bot.rotation);
+    const grad = ctx.createRadialGradient(-2, -2, 0, 0, 0, bot.radius);
+    grad.addColorStop(0, '#ff6b6b');
+    grad.addColorStop(1, '#c0392b');
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(0, 0, bot.radius, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#8e2424'; ctx.lineWidth = 2; ctx.stroke();
 
-    // Shield bar
-    if (p.shield > 0) {
-      ctx.fillStyle = '#333'; ctx.fillRect(bx, by - 14, barW, 12);
-      ctx.fillStyle = '#3498db'; ctx.fillRect(bx, by - 14, barW * (p.shield / CONFIG.PLAYER_MAX_SHIELD), 12);
-      ctx.strokeRect(bx, by - 14, barW, 12);
-      ctx.fillStyle = '#fff'; ctx.font = 'bold 10px monospace';
-      ctx.fillText(`${Math.ceil(p.shield)} SHIELD`, bx + barW / 2, by - 4);
-    }
-
-    // Weapon slots
-    const slotSize = 50; const slotGap = 5;
-    const totalWidth = 5 * (slotSize + slotGap) - slotGap;
-    const startX = cw / 2 - totalWidth / 2;
-    const slotY = ch - 50;
-    for (let i = 0; i < 5; i++) {
-      const sx = startX + i * (slotSize + slotGap);
-      const isSelected = i === p.selectedSlot;
-      ctx.fillStyle = isSelected ? '#f1c40f' : '#2c3e50';
-      ctx.fillRect(sx, slotY, slotSize, slotSize);
-      ctx.strokeStyle = isSelected ? '#fff' : '#555';
-      ctx.lineWidth = isSelected ? 3 : 1;
-      ctx.strokeRect(sx, slotY, slotSize, slotSize);
-      const weapon = p.inventory[i];
-      if (weapon) {
-        ctx.fillStyle = '#fff'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
-        ctx.fillText(weapon.name.substring(0, 6), sx + slotSize / 2, slotY + 20);
-        if (weapon.ammo !== Infinity) ctx.fillText(`${weapon.ammo}`, sx + slotSize / 2, slotY + 38);
-      }
-      ctx.fillStyle = '#aaa'; ctx.font = 'bold 12px monospace';
-      ctx.fillText(`${i + 1}`, sx + 8, slotY + 12);
-    }
-
-    // Materials
-    ctx.textAlign = 'left';
-    ctx.fillStyle = '#d4a373'; ctx.fillText(`Wood: ${p.materials.wood}`, 20, ch - 60);
-    ctx.fillStyle = '#c0392b'; ctx.fillText(`Brick: ${p.materials.brick}`, 20, ch - 45);
-    ctx.fillStyle = '#7f8c8d'; ctx.fillText(`Metal: ${p.materials.metal}`, 20, ch - 30);
-
-    // Building indicator
-    if (this.buildingSystem.isBuilding) {
-      ctx.fillStyle = '#f1c40f'; ctx.font = 'bold 14px monospace';
-      ctx.fillText(`BUILDING: ${this.buildingSystem.getBuildMode()?.toUpperCase()} [${this.buildingSystem.getMaterial().toUpperCase()}]`, 20, ch - 100);
-    }
-
-    // Coordinates & alive count
-    ctx.fillStyle = '#fff'; ctx.font = '12px monospace';
-    ctx.fillText(`Pos: ${Math.round(p.pos.x)}, ${Math.round(p.pos.y)}`, 20, 30);
-    ctx.fillText(`Alive: ${this.state.playersAlive}`, 20, 50);
-
-    // After coordinates, add:
-    ctx.textAlign = 'left';
     ctx.fillStyle = '#fff';
-    ctx.fillText(`Storm Phase: ${this.state.stormPhase + 1}`, 20, 70);
-    ctx.fillText(`Storm Dmg: ${this.state.stormDamage}/s`, 20, 90);
-
-    // Minimap (top right)
-    const mapSize = 150;
-    const mx = cw - mapSize - 20;
-    const my = 20;
-    const scale = mapSize / CONFIG.MAP_SIZE;
-
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.fillRect(mx, my, mapSize, mapSize);
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(mx, my, mapSize, mapSize);
-
-    // Storm on minimap
-    ctx.fillStyle = 'rgba(138,43,226,0.5)';
     ctx.beginPath();
-    ctx.arc(mx + this.state.stormCenter.x * scale, my + this.state.stormCenter.y * scale, this.state.stormRadius * scale, 0, Math.PI * 2);
+    ctx.moveTo(bot.radius + 6, 0);
+    ctx.lineTo(bot.radius - 4, -5);
+    ctx.lineTo(bot.radius - 4, 5);
     ctx.fill();
 
-    // Player on minimap
-    ctx.fillStyle = '#4fc3f7';
-    ctx.beginPath();
-    ctx.arc(mx + p.pos.x * scale, my + p.pos.y * scale, 3, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Bots on minimap (single-player only)
-    if (!this.isMultiplayer) {
-      ctx.fillStyle = 'rgba(231,76,60,0.6)';
-      for (const bot of this.state.bots) {
-        if (!bot.alive) continue;
-        ctx.beginPath();
-        ctx.arc(mx + bot.pos.x * scale, my + bot.pos.y * scale, 2, 0, Math.PI * 2);
-        ctx.fill();
-      }
+    if (bot.inventory && bot.inventory[bot.selectedSlot]) {
+      ctx.fillStyle = '#555';
+      ctx.fillRect(bot.radius - 2, -2.5, 12, 5);
     }
-    // Remote players on minimap (multiplayer)
-    if (this.isMultiplayer) {
-      ctx.fillStyle = 'rgba(155,89,182,0.6)';
-      for (const [_, rp] of this.remotePlayers) {
-        if (!rp.alive) continue;
-        ctx.beginPath();
-        ctx.arc(mx + rp.x * scale, my + rp.y * scale, 2, 0, Math.PI * 2);
-        ctx.fill();
-      }
+    ctx.restore();
+
+    const barW = 32;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(-barW / 2, -bot.radius - 12, barW, 5);
+    const healthPct = bot.health / CONFIG.PLAYER_MAX_HEALTH;
+    ctx.fillStyle = healthPct > 0.5 ? '#2ecc71' : healthPct > 0.25 ? '#f39c12' : '#e74c3c';
+    ctx.fillRect(-barW / 2, -bot.radius - 12, barW * healthPct, 5);
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)'; ctx.lineWidth = 1; ctx.strokeRect(-barW / 2, -bot.radius - 12, barW, 5);
+
+    if (bot.shield > 0) {
+      ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(-barW / 2, -bot.radius - 18, barW, 4);
+      ctx.fillStyle = '#3498db'; ctx.fillRect(-barW / 2, -bot.radius - 18, barW * (bot.shield / CONFIG.PLAYER_MAX_SHIELD), 4);
     }
 
-    // Safe zone outline
-    ctx.strokeStyle = '#2ecc71';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(mx + this.state.stormCenter.x * scale, my + this.state.stormCenter.y * scale, this.state.stormRadius * scale, 0, Math.PI * 2);
-    ctx.stroke();
-
-    // Storm warning overlay
-    const warning = this.stormSystem.getStormWarning(this.state);
-    if (warning > 0) {
-      ctx.fillStyle = `rgba(138, 43, 226, ${warning * 0.3})`;
-      ctx.fillRect(0, 0, cw, ch);
-    }
-
-    // Victory/Defeat screen
-    if (this.state.matchPhase === 'ended') {
-      ctx.fillStyle = 'rgba(0,0,0,0.7)';
-      ctx.fillRect(0, 0, cw, ch);
-      ctx.fillStyle = '#f1c40f';
-      ctx.font = 'bold 48px monospace';
-      ctx.textAlign = 'center';
-      const msg = this.state.player.alive ? 'VICTORY ROYALE!' : 'ELIMINATED';
-      ctx.fillText(msg, cw / 2, ch / 2);
-      ctx.font = '20px monospace';
-      ctx.fillText('Press N to restart', cw / 2, ch / 2 + 50);
-      ctx.fillStyle = '#3498db';
-      ctx.font = '16px monospace';
-      ctx.fillText('Press K for Kill Cam', cw / 2, ch / 2 + 80);
-    }
-
-    // Spectator indicator
-    if (this.spectatorSystem.active) {
-      const target = this.spectatorSystem.getCurrentTarget();
-      ctx.fillStyle = '#f1c40f';
-      ctx.font = 'bold 20px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText(`SPECTATING: ${target?.id === 'player' ? 'YOU' : target?.id || 'NONE'}`, cw / 2, ch / 2 + 110);
-      ctx.font = '14px monospace';
-      ctx.fillText('LEFT/RIGHT to switch targets', cw / 2, ch / 2 + 130);
-    }
-
-    // Kill feed
-    ctx.textAlign = 'right';
-    for (let i = 0; i < this.state.killFeed.length; i++) {
-      ctx.fillText(this.state.killFeed[i], cw - 20, 30 + i * 18);
-    }
+    ctx.restore();
   }
 
   private showKillCam() {
     const frames = this.replaySystem.getKillCamFrames(this.state.matchTime, 3);
     if (frames.length === 0) return;
-    // Simple: just log for now, full playback is complex
     console.log('Kill cam frames:', frames.length);
   }
 
@@ -1062,7 +909,7 @@ export class GameEngine {
     this.mobilitySystem.spawnMobilityFeatures(this.state);
     this.itemSystem = new ItemSystem();
     this.aiSystem = new AISystem(this.combatSystem);
-    this.aiSystem.spawnBots(this.state, 20);
+    this.aiSystem.spawnBots(this.state, 50);
     this.stormSystem = new StormSystem();
     this.state.stormRadius = CONFIG.MAP_SIZE * 0.8;
     this.state.stormCenter = vec2(CONFIG.MAP_SIZE / 2, CONFIG.MAP_SIZE / 2);
@@ -1070,11 +917,15 @@ export class GameEngine {
     this.state.nextStormRadius = CONFIG.MAP_SIZE * 0.8;
     this.bossSystem = new BossSystem();
     this.aiDirector = new AIDirector();
+    this.vehicleSystem = new VehicleSystem();
+    this.vehicleSystem.spawnVehicles(CONFIG.MAP_SIZE);
     this.lastTime = performance.now();
     this.matchStats = { kills: 0, damageDealt: 0, buildingsBuilt: 0 };
     this.matchStatsReported = false;
     this.spectatorSystem.stopSpectating();
     this.replaySystem.clear();
+    this.gameTime = 0;
+    this.hud = new HUDRenderer();
     this.start();
   }
 
