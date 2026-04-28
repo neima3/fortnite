@@ -21,6 +21,9 @@ import { BattleBusSystem } from './systems/BattleBusSystem.js';
 import { LootChestSystem } from './systems/LootChestSystem.js';
 import { EmoteSystem } from './systems/EmoteSystem.js';
 import { NPCSystem } from './systems/NPCSystem.js';
+import { GameModeSystem } from './systems/GameModeSystem.js';
+import { FishingSystem } from './systems/FishingSystem.js';
+import { KillStreakSystem } from './systems/KillStreakSystem.js';
 import { createExplosion, createMuzzleFlash, createHitMarker, updateParticle, createBloodSplat, createFootstepDust, createLootBeam } from './entities/Particle.js';
 import { ColyseusSession } from './client/network/ColyseusSession.js';
 import { ProgressionSystem } from './systems/ProgressionSystem.js';
@@ -68,6 +71,9 @@ export class GameEngine {
   private chestSystem: LootChestSystem;
   private emoteSystem: EmoteSystem;
   private npcSystem: NPCSystem;
+  private gameModeSystem: GameModeSystem;
+  private fishingSystem: FishingSystem;
+  private killStreakSystem: KillStreakSystem;
   private gameTime: number = 0;
   private lastDamageTime: number = 0;
   private lastPlayerPos: { x: number; y: number } = { x: 0, y: 0 };
@@ -128,6 +134,12 @@ export class GameEngine {
     this.emoteSystem = new EmoteSystem();
     this.npcSystem = new NPCSystem();
     this.npcSystem.spawnNPCs(this.mapGen.buildings);
+    this.gameModeSystem = new GameModeSystem();
+    this.fishingSystem = new FishingSystem();
+    const allTiles = this.tiles.flat();
+    this.fishingSystem.spawnFishingSpots(allTiles);
+    this.fishingSystem.spawnForageBushes(allTiles);
+    this.killStreakSystem = new KillStreakSystem();
     this.loadSettings();
 
     const originalApplyDamage = this.combatSystem.applyDamage.bind(this.combatSystem);
@@ -148,6 +160,7 @@ export class GameEngine {
           this.hud.addDamageNumber(target.pos.x, target.pos.y, Math.round(actualDmg || shieldDmg), shieldDmg > 0 && actualDmg === 0, false);
           if (attackerId === 'player') {
             this.audioManager.playHit();
+            this.killStreakSystem.onDamageDealt(actualDmg || shieldDmg);
           }
           if (targetId === 'player') {
             this.renderer.triggerDamageFlash();
@@ -164,6 +177,10 @@ export class GameEngine {
         this.renderer.triggerKillFlash();
         this.audioManager.playElimination();
         this.hud.addKillFeedEntry(`You eliminated ${target.id}`, true);
+        const killDist = dist(this.state.player.pos, target.pos);
+        const weapon = this.state.player.inventory[this.state.player.selectedSlot];
+        const banner = this.killStreakSystem.onKill(killDist, weapon?.type || 'pickaxe', false);
+        this.killStreakSystem.onShotFired(true);
       } else if (wasAlive && target && !target.alive && attackerId !== 'player') {
         this.hud.addKillFeedEntry(`${attackerId} eliminated ${target.id}`, false);
       }
@@ -175,16 +192,54 @@ export class GameEngine {
   private showMainMenu() {
     this.menu.showMainMenu(
       () => { this.menu.hide(); this.showModeSelect(); },
-      () => this.showSettings(),
+      () => { this.menu.showSettings(); },
       () => { this.menu.showProgression(this.progression.getProgress(), () => this.showMainMenu()); }
     );
   }
 
   private showModeSelect() {
-    this.menu.showModeSelect(
-      () => { this.menu.hide(); this.input.destroy(); this.input = new InputManager(this.canvas); this.gameStarted = true; this.isMultiplayer = false; this.audioManager.resume(); this.initBusPhase(); this.start(); },
-      () => { this.menu.hide(); this.showMultiplayerLobby(); }
-    );
+    const modes = this.gameModeSystem.getModes();
+    const modeButtons = modes.map(m =>
+      `<button id="btn-mode-${m.id}" style="padding:15px 40px;font-size:18px;background:${m.id === 'solo' ? '#f1c40f' : m.id === 'zonewars' ? '#e74c3c' : '#3498db'};color:#1a1a2e;border:none;border-radius:8px;cursor:pointer;margin:8px;font-family:monospace;font-weight:bold;min-width:250px;">
+        ${m.icon} ${m.name}
+        <div style="font-size:11px;font-weight:normal;color:#333;margin-top:4px;">${m.description}</div>
+      </button>`
+    ).join('');
+    this.menu.container.innerHTML = `
+      <div id="mode-select" style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:linear-gradient(135deg,#1a1a2e,#16213e);color:#fff;font-family:monospace;">
+        <h1 style="font-size:48px;margin-bottom:40px;text-shadow:0 0 20px #f1c40f;">SELECT MODE</h1>
+        ${modeButtons}
+        <button id="btn-multi" style="padding:12px 40px;font-size:16px;background:transparent;color:#f1c40f;border:2px solid #f1c40f;border-radius:8px;cursor:pointer;margin:15px;font-family:monospace;">MULTIPLAYER</button>
+      </div>
+    `;
+    this.menu.container.style.pointerEvents = 'auto';
+    modes.forEach(m => {
+      document.getElementById(`btn-mode-${m.id}`)!.onclick = () => {
+        this.gameModeSystem.setMode(m.id);
+        this.menu.hide();
+        this.input.destroy();
+        this.input = new InputManager(this.canvas);
+        this.gameStarted = true;
+        this.isMultiplayer = false;
+        this.audioManager.resume();
+        this.applyGameMode();
+        this.initBusPhase();
+        this.start();
+      };
+    });
+    document.getElementById('btn-multi')!.onclick = () => { this.menu.hide(); this.showMultiplayerLobby(); };
+  }
+
+  private applyGameMode() {
+    const mode = this.gameModeSystem.getActiveMode();
+    const p = this.state.player;
+    p.materials = { ...mode.startMaterials };
+    p.inventory = mode.startInventory.map(t => this.createWeapon(t));
+    while (p.inventory.length < 5) p.inventory.push(null);
+    const botCount = mode.botCount;
+    this.aiSystem = new AISystem(this.combatSystem);
+    this.aiSystem.spawnBots(this.state, botCount);
+    this.state.playersAlive = 1 + botCount;
   }
 
   private async showMultiplayerLobby() {
@@ -380,6 +435,20 @@ export class GameEngine {
     this.aiDirector.update(this.state, dt);
     this.vehicleSystem.update(this.state, dt);
     this.replaySystem.recordFrame(this.state.matchTime, this.state);
+    this.killStreakSystem.update(dt);
+
+    const fishingResult = this.fishingSystem.update(dt);
+    if (fishingResult) {
+      if (fishingResult.shieldAmount) { player.shield = Math.min(CONFIG.PLAYER_MAX_SHIELD, player.shield + fishingResult.shieldAmount); }
+      if (fishingResult.healthAmount) { player.health = Math.min(CONFIG.PLAYER_MAX_HEALTH, player.health + fishingResult.healthAmount); }
+      if (fishingResult.speedBoost) { player.speed = CONFIG.PLAYER_SPEED * fishingResult.speedBoost; setTimeout(() => { player.speed = CONFIG.PLAYER_SPEED; }, (fishingResult.speedDuration || 5) * 1000); }
+      if (fishingResult.materials) { player.materials.wood += fishingResult.materials.wood || 0; player.materials.brick += fishingResult.materials.brick || 0; player.materials.metal += fishingResult.materials.metal || 0; }
+      if (fishingResult.weaponType) {
+        const emptySlot = player.inventory.findIndex(w => w === null);
+        if (emptySlot !== -1) player.inventory[emptySlot] = this.createWeapon(fishingResult.weaponType);
+      }
+      this.audioManager.playPickup();
+    }
 
     this.playerInVehicle = this.vehicleSystem.getVehicleForPlayer('player') !== null;
 
@@ -425,6 +494,13 @@ export class GameEngine {
         player.vel = vec2Mul(dir, speed);
         this.audioManager.playFootstep(player.pos.x, player.pos.y, player.sprinting);
         if (Math.random() < 0.1) this.state.particles.push(...createFootstepDust(player.pos));
+        const forage = this.fishingSystem.tryForage(player.pos, player.radius);
+        if (forage) {
+          if (forage.type === 'apple') player.health = Math.min(CONFIG.PLAYER_MAX_HEALTH, player.health + 10);
+          else if (forage.type === 'mushroom') player.shield = Math.min(CONFIG.PLAYER_MAX_SHIELD, player.shield + 10);
+          else if (forage.type === 'hop') { player.speed *= 1.3; setTimeout(() => { player.speed = CONFIG.PLAYER_SPEED; }, 10000); }
+          this.audioManager.playPickup();
+        }
       } else {
         player.vel = { x: 0, y: 0 };
       }
@@ -547,6 +623,13 @@ export class GameEngine {
       this.audioManager.playVictory();
     }
 
+    const modeResult = this.gameModeSystem.checkWinCondition(this.state.playersAlive, this.state.player.alive);
+    if (modeResult.won && this.state.matchPhase === 'playing') {
+      this.state.matchPhase = 'ended';
+      this.state.killFeed.unshift(modeResult.message);
+      if (modeResult.winner === 'player') this.audioManager.playVictory();
+    }
+
     if (!this.spectatorSystem.active && !this.state.player.alive && this.state.matchPhase === 'ended') {
       this.spectatorSystem.startSpectating(this.state);
     }
@@ -603,6 +686,12 @@ export class GameEngine {
       if (npc && !this.npcSystem.isShopOpen()) {
         this.audioManager.playPickup();
       }
+      if (!this.fishingSystem.tryFish(player.pos, player.radius) && !picked && !opened && !chest && !npc) {
+      }
+    }
+
+    if (input.isKeyDown('h')) {
+      this.fishingSystem.tryFish(player.pos, player.radius);
     }
 
     if (input.isKeyDown('v')) {
@@ -658,6 +747,7 @@ export class GameEngine {
     }
 
     this.lastPlayerPos = { x: player.pos.x, y: player.pos.y };
+    this.killStreakSystem.onDistanceTraveled(dist(player.pos, this.lastPlayerPos));
   }
 
   private updateBusPhase(dt: number): void {
@@ -900,6 +990,7 @@ export class GameEngine {
     this.vehicleSystem.render(ctx, this.camera);
     this.chestSystem.render(ctx, this.gameTime);
     this.npcSystem.render(ctx, this.gameTime);
+    this.fishingSystem.render(ctx, this.gameTime);
     if (!this.npcSystem.isShopOpen()) {
       (this.npcSystem as any).renderInteractPrompt?.(ctx, this.state.player.pos, this.state.player.radius);
     }
@@ -969,6 +1060,10 @@ export class GameEngine {
       ctx.shadowBlur = 0;
       ctx.fillStyle = '#fff'; ctx.font = '18px monospace';
       ctx.fillText(`Kills: ${this.matchStats.kills} | Damage: ${this.matchStats.damageDealt} | Placement: #1`, 0, 50);
+      const ks = this.killStreakSystem.getStats();
+      ctx.fillStyle = '#aaa'; ctx.font = '14px monospace';
+      ctx.fillText(`Best Streak: ${ks.bestStreak} | Headshots: ${ks.headshots} | Accuracy: ${ks.shotsFired > 0 ? Math.round(ks.shotsHit / ks.shotsFired * 100) : 0}%`, 0, 80);
+      ctx.fillText(`Chests: ${ks.chestsOpened} | Built: ${ks.buildingsBuilt} | Distance: ${Math.round(ks.distanceTraveled)}m`, 0, 100);
       ctx.restore();
     }
 
@@ -977,6 +1072,18 @@ export class GameEngine {
       ctx.fillText(`FPS: ${this.currentFps}`, 10, this.camera.height - 10);
       ctx.fillText(`Particles: ${this.state.particles.length}`, 10, this.camera.height - 28);
       ctx.fillText(`Time: ${this.renderer.getTimeOfDay().toFixed(1)}h`, 10, this.camera.height - 46);
+    }
+
+    this.killStreakSystem.renderBanner(ctx, this.camera.width, this.camera.height);
+    this.killStreakSystem.renderCombo(ctx, this.camera.width - 160, this.camera.height / 2);
+    this.fishingSystem.renderFishingUI(ctx, this.camera.width, this.camera.height);
+
+    const activeMode = this.gameModeSystem.getActiveMode();
+    ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center';
+    ctx.fillText(`${activeMode.icon} ${activeMode.name}`, this.camera.width / 2, 15);
+    if (activeMode.teamMode) {
+      ctx.fillStyle = this.gameModeSystem.getPlayerTeam() === 'blue' ? '#3498db' : '#e74c3c';
+      ctx.fillText(`Team: ${this.gameModeSystem.getPlayerTeam().toUpperCase()} | Score: ${this.gameModeSystem.getTeamScore(this.gameModeSystem.getPlayerTeam())}`, this.camera.width / 2, 30);
     }
 
     ctx.textAlign = 'left';
@@ -1098,6 +1205,11 @@ export class GameEngine {
     this.vehicleSystem = new VehicleSystem();
     this.vehicleSystem.spawnVehicles(CONFIG.MAP_SIZE);
     this.emoteSystem = new EmoteSystem();
+    this.fishingSystem = new FishingSystem();
+    this.fishingSystem.spawnFishingSpots(this.tiles.flat());
+    this.fishingSystem.spawnForageBushes(this.tiles.flat());
+    this.killStreakSystem = new KillStreakSystem();
+    this.applyGameMode();
     this.lastTime = performance.now();
     this.matchStats = { kills: 0, damageDealt: 0, buildingsBuilt: 0 };
     this.matchStatsReported = false;

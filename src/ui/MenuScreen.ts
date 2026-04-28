@@ -1,7 +1,7 @@
 import { LEVEL_XP_REQUIREMENTS } from '../systems/ProgressionSystem.js';
 
 export class MenuScreen {
-  private container: HTMLElement;
+  public container: HTMLElement;
   private visible: boolean = false;
 
   constructor() {
