@@ -31,6 +31,10 @@ import { ReplaySystem } from './systems/ReplaySystem.js';
 import { SpectatorSystem } from './systems/SpectatorSystem.js';
 import { BossSystem } from './systems/BossSystem.js';
 import { AIDirector } from './systems/AIDirector.js';
+import { UpgradeBenchSystem } from './systems/UpgradeBenchSystem.js';
+import { StormTimerBar } from './systems/StormTimerBar.js';
+import { MinimapPingSystem } from './systems/MinimapPingSystem.js';
+import { WeaponSwitchAnimation } from './systems/WeaponSwitchAnimation.js';
 
 export class GameEngine {
   private canvas: HTMLCanvasElement;
@@ -74,6 +78,10 @@ export class GameEngine {
   private gameModeSystem: GameModeSystem;
   private fishingSystem: FishingSystem;
   private killStreakSystem: KillStreakSystem;
+  private upgradeBenchSystem: UpgradeBenchSystem;
+  private stormTimerBar: StormTimerBar;
+  private minimapPingSystem: MinimapPingSystem;
+  private weaponSwitchAnim: WeaponSwitchAnimation;
   private gameTime: number = 0;
   private lastDamageTime: number = 0;
   private lastPlayerPos: { x: number; y: number } = { x: 0, y: 0 };
@@ -140,6 +148,11 @@ export class GameEngine {
     this.fishingSystem.spawnFishingSpots(allTiles);
     this.fishingSystem.spawnForageBushes(allTiles);
     this.killStreakSystem = new KillStreakSystem();
+    this.upgradeBenchSystem = new UpgradeBenchSystem();
+    this.upgradeBenchSystem.spawnBenches(this.mapGen.buildings);
+    this.stormTimerBar = new StormTimerBar();
+    this.minimapPingSystem = new MinimapPingSystem();
+    this.weaponSwitchAnim = new WeaponSwitchAnimation();
     this.loadSettings();
 
     const originalApplyDamage = this.combatSystem.applyDamage.bind(this.combatSystem);
@@ -176,9 +189,9 @@ export class GameEngine {
         this.matchStats.kills++;
         this.renderer.triggerKillFlash();
         this.audioManager.playElimination();
-        this.hud.addKillFeedEntry(`You eliminated ${target.id}`, true);
         const killDist = dist(this.state.player.pos, target.pos);
         const weapon = this.state.player.inventory[this.state.player.selectedSlot];
+        this.hud.addKillFeedEntry(`You eliminated ${target.id}`, true, weapon?.type || 'pickaxe', killDist, false);
         const banner = this.killStreakSystem.onKill(killDist, weapon?.type || 'pickaxe', false);
         this.killStreakSystem.onShotFired(true);
       } else if (wasAlive && target && !target.alive && attackerId !== 'player') {
@@ -436,6 +449,14 @@ export class GameEngine {
     this.vehicleSystem.update(this.state, dt);
     this.replaySystem.recordFrame(this.state.matchTime, this.state);
     this.killStreakSystem.update(dt);
+    this.weaponSwitchAnim.update(dt);
+    this.minimapPingSystem.update(dt);
+
+    const upgradeResult = this.upgradeBenchSystem.update(dt);
+    if (upgradeResult) {
+      this.audioManager.playPickup();
+      this.renderer.triggerHealFlash();
+    }
 
     const fishingResult = this.fishingSystem.update(dt);
     if (fishingResult) {
@@ -557,7 +578,9 @@ export class GameEngine {
     if (input.isKeyDown('t')) this.buildingSystem.setBuildMode('roof');
     if (input.isKeyDown('g')) this.buildingSystem.toggleMaterial();
     if (input.isKeyDown('escape')) {
-      if (this.buildingSystem.isBuilding) this.buildingSystem.setBuildMode(null);
+      if (this.upgradeBenchSystem.isMenuOpen()) {
+        this.upgradeBenchSystem.closeMenu();
+      } else if (this.buildingSystem.isBuilding) this.buildingSystem.setBuildMode(null);
       else if (this.gameStarted) {
         if (this.paused) { this.paused = false; this.menu.hide(); this.lastTime = performance.now(); }
         else this.showPauseMenu();
@@ -576,7 +599,17 @@ export class GameEngine {
       }
     }
 
-    for (let i = 1; i <= 5; i++) { if (input.isKeyDown(String(i))) player.selectedSlot = i - 1; }
+    for (let i = 1; i <= 5; i++) {
+      if (input.isKeyDown(String(i)) && player.selectedSlot !== i - 1) {
+        const oldSlot = player.selectedSlot;
+        player.selectedSlot = i - 1;
+        const newWeapon = player.inventory[player.selectedSlot];
+        if (newWeapon) {
+          this.weaponSwitchAnim.startSwitch(oldSlot, i - 1, newWeapon.name || 'Weapon');
+          this.weaponSwitchAnim.spawnParticlesAt(player.pos.x, player.pos.y, i - 1);
+        }
+      }
+    }
 
     if (!this.spectatorSystem.active) this.camera.follow(player.pos, dt, CONFIG.CAMERA_SMOOTH);
 
@@ -665,6 +698,10 @@ export class GameEngine {
     }
 
     if (input.isKeyDown('f')) {
+      const bench = this.upgradeBenchSystem.tryInteract(player.pos, player.radius);
+      if (bench && !this.upgradeBenchSystem.isMenuOpen()) {
+        this.upgradeBenchSystem.tryInteract(player.pos, player.radius);
+      }
       const picked = this.lootSystem.tryPickup(this.state, this.state.player);
       const opened = this.itemSystem.tryOpenSupplyDrop(this.state, this.state.player);
       const chest = this.chestSystem.tryOpen(player.pos, player.radius);
@@ -715,6 +752,10 @@ export class GameEngine {
     }
 
     if (input.isKeyDown('f3')) this.showFps = !this.showFps;
+
+    if (input.isKeyDown('p')) {
+      this.minimapPingSystem.addPing(mouseWorld);
+    }
 
     if (input.isKeyDown('tab') && !this.emoteSystem.getState().showWheel) {
       this.emoteSystem.toggleWheel();
@@ -839,16 +880,41 @@ export class GameEngine {
     ctx.strokeStyle = '#4a3525';
     ctx.lineWidth = 3;
     for (const b of this.mapGen.buildings) {
-      if (b.x + b.width < viewLeft || b.x > viewRight || b.y + b.height < viewTop || b.y > viewBottom) continue;
+      if (b.x + b.width < viewLeft - 500 || b.x > viewRight + 500 || b.y + b.height < viewTop - 500 || b.y > viewBottom + 500) continue;
+      ctx.fillStyle = '#6b4f3a';
       ctx.fillRect(b.x, b.y, b.width, b.height);
+      ctx.strokeStyle = '#4a3525';
       ctx.strokeRect(b.x, b.y, b.width, b.height);
       ctx.fillStyle = 'rgba(0,0,0,0.15)';
       for (let wx = b.x; wx < b.x + b.width; wx += 50) { ctx.fillRect(wx, b.y, 2, b.height); }
       for (let wy = b.y; wy < b.y + b.height; wy += 50) { ctx.fillRect(b.x, wy, b.width, 2); }
-      ctx.fillStyle = '#6b4f3a';
       ctx.fillStyle = '#fff'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center';
       ctx.fillText(b.name, b.x + b.width / 2, b.y + b.height / 2);
       ctx.fillStyle = '#6b4f3a';
+
+      const poiCenterX = b.x + b.width / 2;
+      const poiCenterY = b.y - 15;
+      const poiDist = dist(this.state.player.pos, { x: poiCenterX, y: poiCenterY });
+      if (poiDist < 600) {
+        const poiAlpha = Math.max(0.3, 1 - poiDist / 600);
+        ctx.save();
+        ctx.globalAlpha = poiAlpha;
+        ctx.fillStyle = 'rgba(255,255,255,0.9)';
+        ctx.font = `bold ${Math.max(10, 16 - poiDist / 100)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.shadowColor = 'rgba(0,0,0,0.8)';
+        ctx.shadowBlur = 4;
+        ctx.fillText(b.name.toUpperCase(), poiCenterX, poiCenterY);
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = 'rgba(241, 196, 15, 0.6)';
+        ctx.beginPath();
+        ctx.moveTo(poiCenterX, poiCenterY + 4);
+        ctx.lineTo(poiCenterX - 5, poiCenterY + 10);
+        ctx.lineTo(poiCenterX + 5, poiCenterY + 10);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
     }
 
     if (this.buildingSystem.isBuilding && this.buildingSystem.getGhostPos()) {
@@ -991,6 +1057,8 @@ export class GameEngine {
     this.chestSystem.render(ctx, this.gameTime);
     this.npcSystem.render(ctx, this.gameTime);
     this.fishingSystem.render(ctx, this.gameTime);
+    this.upgradeBenchSystem.render(ctx, this.gameTime);
+    this.minimapPingSystem.renderWorld(ctx, this.gameTime);
     if (!this.npcSystem.isShopOpen()) {
       (this.npcSystem as any).renderInteractPrompt?.(ctx, this.state.player.pos, this.state.player.radius);
     }
@@ -1077,6 +1145,19 @@ export class GameEngine {
     this.killStreakSystem.renderBanner(ctx, this.camera.width, this.camera.height);
     this.killStreakSystem.renderCombo(ctx, this.camera.width - 160, this.camera.height / 2);
     this.fishingSystem.renderFishingUI(ctx, this.camera.width, this.camera.height);
+    this.weaponSwitchAnim.render(ctx, this.camera.width, this.camera.height);
+    this.stormTimerBar.render(ctx, this.camera.width, this.camera.height, this.state.stormTimer, this.state.stormPhase, this.state.stormTimer > 0 && this.state.stormRadius > this.state.nextStormRadius, this.state.stormDamage, this.state.playersAlive);
+
+    if (this.upgradeBenchSystem.isMenuOpen()) {
+      this.upgradeBenchSystem.renderMenu(ctx, this.camera.width, this.camera.height, this.state.player.inventory, this.state.player.materials);
+    }
+
+    const mmSize = 160;
+    const mmCX = this.camera.width - mmSize / 2 - 16;
+    const mmCY = mmSize / 2 + 16;
+    this.minimapPingSystem.renderMinimap(ctx, mmCX - mmSize / 2, mmCY - mmSize / 2, mmSize, this.state.mapSize);
+    const enemyPositions = this.state.bots.map((b: any) => ({ x: b.pos.x, y: b.pos.y, alive: b.alive }));
+    this.minimapPingSystem.renderDangerIndicators(ctx, this.camera.width, this.camera.height, this.state.player.pos, enemyPositions);
 
     const activeMode = this.gameModeSystem.getActiveMode();
     ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center';
@@ -1088,7 +1169,7 @@ export class GameEngine {
 
     ctx.textAlign = 'left';
     ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.font = '10px monospace';
-    ctx.fillText('F3: Debug | B: Vehicle', 10, this.camera.height - 5);
+    ctx.fillText('F3: Debug | B: Vehicle | P: Ping | F: Bench/Fish/Loot', 10, this.camera.height - 5);
   }
 
   private renderPlayer(ctx: CanvasRenderingContext2D, player: Player): void {
@@ -1209,6 +1290,10 @@ export class GameEngine {
     this.fishingSystem.spawnFishingSpots(this.tiles.flat());
     this.fishingSystem.spawnForageBushes(this.tiles.flat());
     this.killStreakSystem = new KillStreakSystem();
+    this.upgradeBenchSystem = new UpgradeBenchSystem();
+    this.upgradeBenchSystem.spawnBenches(this.mapGen.buildings);
+    this.minimapPingSystem = new MinimapPingSystem();
+    this.weaponSwitchAnim = new WeaponSwitchAnimation();
     this.applyGameMode();
     this.lastTime = performance.now();
     this.matchStats = { kills: 0, damageDealt: 0, buildingsBuilt: 0 };

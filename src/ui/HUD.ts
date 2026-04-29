@@ -15,6 +15,9 @@ export interface KillFeedEntry {
   text: string;
   time: number;
   isPlayerKill: boolean;
+  weaponType?: string;
+  distance?: number;
+  headshot?: boolean;
 }
 
 const RARITY_COLORS: Record<string, string> = {
@@ -111,11 +114,14 @@ export class HUDRenderer {
     });
   }
 
-  addKillFeedEntry(text: string, isPlayerKill: boolean): void {
+  addKillFeedEntry(text: string, isPlayerKill: boolean, weaponType?: string, distance?: number, headshot?: boolean): void {
     const entry: KillFeedEntry = {
       text,
       time: Date.now(),
       isPlayerKill,
+      weaponType,
+      distance,
+      headshot,
     };
     this.killFeed.unshift(entry);
     this.killFeedSlide.set(this.killFeed.indexOf(entry), 0);
@@ -671,9 +677,9 @@ export class HUDRenderer {
     cw: number,
     ch: number,
   ): void {
-    const feedX = cw - 176;
+    const feedX = cw - 220;
     const feedY = 192;
-    const entryH = 22;
+    const entryH = 28;
 
     ctx.save();
 
@@ -691,23 +697,45 @@ export class HUDRenderer {
       ctx.globalAlpha = alpha;
 
       ctx.fillStyle = entry.isPlayerKill
-        ? 'rgba(200, 160, 40, 0.35)'
-        : 'rgba(30, 30, 40, 0.55)';
-      this.roundRect(ctx, feedX - slideOffset, ey, 160, entryH, 4);
+        ? 'rgba(200, 160, 40, 0.4)'
+        : 'rgba(30, 30, 40, 0.6)';
+      this.roundRect(ctx, feedX - slideOffset, ey, 205, entryH, 4);
       ctx.fill();
 
       if (entry.isPlayerKill) {
-        ctx.strokeStyle = 'rgba(241, 196, 15, 0.5)';
+        ctx.strokeStyle = 'rgba(241, 196, 15, 0.6)';
         ctx.lineWidth = 1;
-        this.roundRect(ctx, feedX - slideOffset, ey, 160, entryH, 4);
+        this.roundRect(ctx, feedX - slideOffset, ey, 205, entryH, 4);
         ctx.stroke();
+      }
+
+      if (entry.weaponType && WEAPON_ICONS[entry.weaponType]) {
+        ctx.save();
+        ctx.fillStyle = entry.isPlayerKill ? '#f1c40f' : '#999';
+        ctx.translate(feedX - slideOffset + 14, ey + entryH / 2);
+        WEAPON_ICONS[entry.weaponType](ctx, 0, 0, 10);
+        ctx.restore();
       }
 
       ctx.font = '10px monospace';
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
       ctx.fillStyle = entry.isPlayerKill ? '#f1c40f' : '#ccc';
-      ctx.fillText(entry.text, feedX - slideOffset + 8, ey + entryH / 2);
+      ctx.fillText(entry.text, feedX - slideOffset + 28, ey + entryH / 2);
+
+      if (entry.headshot) {
+        ctx.fillStyle = '#e74c3c';
+        ctx.font = 'bold 9px monospace';
+        ctx.textAlign = 'right';
+        ctx.fillText('HS', feedX - slideOffset + 200, ey + entryH / 2 - 4);
+      }
+
+      if (entry.distance !== undefined) {
+        ctx.fillStyle = '#888';
+        ctx.font = '8px monospace';
+        ctx.textAlign = 'right';
+        ctx.fillText(`${Math.round(entry.distance)}m`, feedX - slideOffset + 200, ey + entryH / 2 + (entry.headshot ? 6 : 0));
+      }
 
       ctx.globalAlpha = 1;
     }
